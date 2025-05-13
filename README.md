@@ -193,6 +193,6 @@ The overall model framework integrates the autoencoder network with clustering u
 
 ### 2. Simulated “Pendulum” Dataset
 
-[🔗 View the full notebook](simulated.ipynb)
+[🔗 View the full notebook](simulation.ipynb)
 
 ---
