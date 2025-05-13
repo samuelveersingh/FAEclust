@@ -11,6 +11,7 @@ We introduce **FAEclust**, a functional autoencoder framework for clustering mul
 
 ---
 
+<!--
 ## 📦 Installation
 
 1. Clone the repository:
@@ -28,6 +29,7 @@ We introduce **FAEclust**, a functional autoencoder framework for clustering mul
    ```
 
 ---
+-->
 
 ## 🛠️ Core API
 
