@@ -5,6 +5,7 @@ from scipy.interpolate import BSpline
 from .smoothing import Smoothing
 import matplotlib.pyplot as plt
 
+
 ## ------------------------------------------------------------------------- ##
 ## Data Loading & Preprocessing from arff files
 def load_and_preprocess(data_path, label_column=-1):
@@ -97,7 +98,7 @@ def rescale(X, y, name="Dataset"):
 
 ## ------------------------------------------------------------------------- ##
 ## Feature Processing Pipeline 
-def smoothing_features(data, m=20, dis_p=600, fit='bspline'):
+def smoothing_features(data, m=20, dis_p=600, fit='bspline', wavelet_level=None):
     """
     Smooth each feature dimension via chosen basis and return coefficients.
 
@@ -106,44 +107,73 @@ def smoothing_features(data, m=20, dis_p=600, fit='bspline'):
     data : np.ndarray, shape (n_samples, p, T)
         Input functional data to be smoothed.
     m : int, optional
-        Number of basis terms (default=20).
+        Number of basis terms (default=20). For Fourier, interpret m as 2n+1.
     dis_p : int, optional
         Number of fine evaluation grid points (default=600).
-    fit : {'bspline', 'fourier', ...}
-        Basis type passed to Smoothing.
-
-    Returns
-    -------
-    coeffs : np.ndarray, shape (n_samples, p, m)
-        Basis coefficients for each sample-feature.
-    all_curves : np.ndarray, shape (T, p)
-        Smoothed curves evaluated at coarse grid T.
-    basis_smoothing : list
-        List of basis functions used for smoothing.
+    fit : {'bspline', 'fourier', <wavelet name like 'db4'>}
+        Basis type passed to Smoothing. For wavelets pass the wavelet name string (e.g. 'db4').
+    wavelet_level : int or None, optional
+        Wavelet decomposition level. If None and fit is a wavelet, Smoothing may choose via GCV.
+        
     """
-    n, p, T = data.shape
+    n_samples, p, T = data.shape
+    t_coarse = np.linspace(0, 1, T)
     coeffs_list = []
     curves_list = []
+    basis_smoothing = None
 
     for i in range(p):
-        smoothing = Smoothing(
-            dis_p=dis_p,
-            fit=fit,
-            terms=m,
-            data=data[:, i, :]
-        )
-        coeffs_list.append(smoothing.coeffs)  # (n, m)
-        curves_list.append(smoothing.fn_s)                      # callable over t
+        kwargs = dict(dis_p=dis_p, fit=fit, data=data[:, i, :])
+        if fit == 'bspline':
+            kwargs['terms'] = m  # explicit number of spline basis terms
+        elif fit == 'fourier':
+            if m is not None:
+                kwargs['n'] = max(1, (int(m) + 1) // 2)
+        else:
+            # assume wavelet name string (e.g. 'db4')
+            if wavelet_level is not None:
+                kwargs['wavelet_level'] = wavelet_level
 
-    # stack coeffs → (p, n, m) → transpose → (n, p, m)
-    coeffs = np.stack(coeffs_list, axis=0).transpose(1, 0, 2).astype('float32')
+        smoothing = Smoothing(**kwargs)
 
-    # curves_list: list of p callables fn_s(t). Evaluate each over grid t to get (T, p)
-    all_curves = np.stack(curves_list, axis=0).T  # (T, p)
+        # --- Collect coefficients in a stackable (n_samples, m_eff) array ---
+        if fit == 'fourier':
+            C = smoothing.coeffs
+            C = np.asarray(C).astype('float32')
+            coeffs_list.append(C)
+            basis_smoothing = smoothing.fourier_basis()
 
-    basis_smoothing = smoothing.smoothing_basis
+        elif fit == 'bspline':
+            coeffs_list.append(np.asarray(smoothing.coeffs, dtype='float32'))
+            basis_smoothing = smoothing.smoothing_basis
+
+        else:
+            # Wavelet: Smoothing stores thresholded coeff structures; to get fixed-size coeffs ->
+            # project each smoothed curve onto a B-spline basis of size m.
+            # Build projection basis once.
+            if basis_smoothing is None:
+                basis_smoothing = bspline_basis(m)
+                Phi = np.stack([b(t_coarse) for b in basis_smoothing], axis=1)  # [T, m]
+                G = Phi.T @ Phi  # [m, m]
+                G_inv = np.linalg.pinv(G)
+                Phi_pinv = G_inv @ Phi.T       # [m, T]
+            C = np.empty((n_samples, m), dtype='float32')
+            for j, f in enumerate(smoothing.fn_s):
+                y = f(t_coarse)                 # [T]
+                beta = Phi_pinv @ y             # [m]
+                C[j] = beta.astype('float32')
+            coeffs_list.append(C)
+
+        # store the callable curves for this feature (list length n_samples)
+        curves_list.append(smoothing.fn_s)
+
+    # stack coeffs → list of p arrays [n_samples, m_eff] -> (n_samples, p, m_eff)
+    coeffs = np.stack(coeffs_list, axis=1).astype('float32')  # (n_samples, p, m_eff)
+
+    # curves: keep as list-of-lists of callables, shape [p][n_samples]
+    all_curves = curves_list
+
     return coeffs, all_curves, basis_smoothing
-
 
 ## ------------------------------------------------------------------------- ##
 ## plotting the fitted curves
@@ -197,6 +227,7 @@ def bspline_basis(num_basis, degree=3):
         basis_input.append(BSpline(t_t, basis_coefs, degree))
     return basis_input
 
+## ------------------------------------------------------------------------- ##
 def fourier_basis(num_basis):
     """
     Create Fourier basis functions (constant, sines, and cosines).
@@ -242,3 +273,5 @@ def load_dataset(filepath, n_features, n_steps):
     n_samples = flat_X.shape[0]
     X = flat_X.reshape(n_samples, n_features, n_steps)
     return X, y
+
+## ------------------------------------------------------------------------- ##

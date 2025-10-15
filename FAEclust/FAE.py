@@ -1,5 +1,5 @@
 import tensorflow as tf
-from .fista import ConvexClustering   # Convex clustering algorithm (from custom module)
+from .fista import ConvexClustering   # convex clustering algorithm
 import numpy as np
 
 
@@ -52,8 +52,8 @@ class FunctionalAutoencoder:
         t,
         sim_matrix
     ):
-        
-        # Store basic properties
+        ## -----------------------------------------------------------------
+        # --- Store basic properties ---
         self.p = p              # input FD dimensions
         self.layers = layers
         # Extract sizes for first and final functional dims
@@ -74,7 +74,7 @@ class FunctionalAutoencoder:
         # Other hyperparameters
         self.l = l          # input basis count
         self.m = m          # smoothing basis count
-        self.s = self.encoder_dense_dims[-1]  # final encoder latent size
+        self.s = self.encoder_dense_dims[-1]  # final encoder latent space size
         self.lambda_e = lambda_e
         self.lambda_d = lambda_d
         self.lambda_c = lambda_c
@@ -123,7 +123,8 @@ class FunctionalAutoencoder:
         # --- Dense decoder (MLP) parameters ---
         self.W_dense_dec = []
         self.b_dense_dec = []
-        prev_dim = self.encoder_dense_dims[-1]  # s
+        prev_dim = self.encoder_dense_dims[-1]  # or self.s
+        # decoder dense dims are already split; we assume they include the mirror of encoder
         for dim in self.decoder_dense_dims:
             W = self.glorot_uniform_init([prev_dim, dim], name=f"W_dec_{count}")
             b = tf.Variable(tf.zeros([dim]), name=f"b_dec_{count}")
@@ -131,46 +132,45 @@ class FunctionalAutoencoder:
             self.b_dense_dec.append(b)
             prev_dim = dim
             count -= 1
+        # The very last decoder MLP output
         self.Q1 = prev_dim
 
         # --- Functional decoder parameters ---
         # Three functional layers with learnable weights and biases
-        self.Wfn1 = tf.Variable(
-            tf.random.uniform(
-                [self.Q1, self.Z1, self.m],
-                minval=-np.sqrt(6 / (self.Q1 + self.Z1)),
-                maxval=np.sqrt(6 / (self.Q1 + self.Z1))
-            ),
-            dtype=tf.float32,
-            name="Wfn1"
-        )
+        self.Wfn1 = tf.Variable(tf.random.uniform(
+                                    [self.Q1, self.Z1, self.m],
+                                    minval=-np.sqrt(6 / (self.Q1 + self.Z1)),
+                                    maxval=np.sqrt(6 / (self.Q1 + self.Z1))
+                                ),
+                                dtype=tf.float32,
+                                name="Wfn1")
         self.Bfn1 = tf.Variable(tf.zeros([self.Z1, self.m]), name="Bfn1")
-        self.Wfn2 = tf.Variable(
-            tf.random.uniform(
-                [self.Z1, self.Z2, self.m],
-                minval=-np.sqrt(6 / (self.Z1 + self.Z2)),
-                maxval=np.sqrt(6 / (self.Z1 + self.Z2))
-            ),
-            dtype=tf.float32,
-            name="Wfn2"
-        )
+        
+        self.Wfn2 = tf.Variable(tf.random.uniform(
+                                    [self.Z1, self.Z2, self.m],
+                                    minval=-np.sqrt(6 / (self.Z1 + self.Z2)),
+                                    maxval=np.sqrt(6 / (self.Z1 + self.Z2))
+                                ),
+                                dtype=tf.float32,
+                                name="Wfn2")
         self.Bfn2 = tf.Variable(tf.zeros([self.Z2]), name="Bfn2")
-        self.Wfn3 = tf.Variable(
-            tf.random.uniform(
-                [self.Z2, self.p, self.m],
-                minval=-np.sqrt(6 / (self.Z2 + self.p)),
-                maxval=np.sqrt(6 / (self.Z2 + self.p))
-            ),
-            dtype=tf.float32,
-            name="Wfn3"
-        )
+        
+        self.Wfn3 = tf.Variable(tf.random.uniform(
+                                    [self.Z2, self.p, self.m],
+                                    minval=-np.sqrt(6 / (self.Z2 + self.p)),
+                                    maxval=np.sqrt(6 / (self.Z2 + self.p))
+                                ),
+                                dtype=tf.float32,
+                                name="Wfn3")
 
         # Collect trainable variables
         self.encoder_vars = [self.wfn, self.bfn] + self.W_dense_enc + self.b_dense_enc
         self.decoder_vars = self.W_dense_dec + self.b_dense_dec + [
-            self.Wfn1, self.Bfn1, self.Wfn2, self.Bfn2, self.Wfn3
-        ]
-
+                            self.Wfn1, self.Bfn1, self.Wfn2, self.Bfn2, self.Wfn3
+                            ]
+        ## -----------------------------------------------------------------
+    ## --------------------------------------------------------------------- 
+    # --- helper function for initializing MLP variables ---
     def glorot_uniform_init(self, shape, name):
         """
         Glorot uniform initializer for a weight matrix.
@@ -189,12 +189,12 @@ class FunctionalAutoencoder:
         """
         fan_in, fan_out = shape
         limit = np.sqrt(6 / (fan_in + fan_out))
-        return tf.Variable(
-            tf.random.uniform(shape, minval=-limit, maxval=limit),
-            name=name,
-            dtype=tf.float32
-        )
-
+        return tf.Variable(tf.random.uniform(shape, minval=-limit, maxval=limit),
+                           name=name,
+                           dtype=tf.float32)
+    
+    ## ---------------------------------------------------------------------
+    # --- Functional Autoencoder (FAE) network ---
     @tf.function
     def encoder(self, x):
         """
@@ -216,7 +216,8 @@ class FunctionalAutoencoder:
         h = tf.nn.relu(x1)
         # Pass through each dense encoder layer
         for W, b in zip(self.W_dense_enc, self.b_dense_enc):
-            h = tf.nn.elu(tf.matmul(h, W) + b)
+            h = tf.matmul(h, W) + b
+            h = tf.nn.elu(h)
         return h
 
     @tf.function
@@ -235,17 +236,21 @@ class FunctionalAutoencoder:
             Reconstructed functional signals over time grid.
         """
         # Dense decoder MLP 
-        x = h
+        z = h
         for W, b in zip(self.W_dense_dec, self.b_dense_dec):
-            x = tf.nn.elu(tf.matmul(x, W) + b)
-        h_dec = x       # shape [batch, Q1]
+            z = tf.nn.elu(tf.matmul(z, W) + b)
+        h_dec = z       # shape [batch, Q1]
         
         # Functional decoding: three-layer tensor contractions
+        # Layer 1: z -> [Z1, m], combine with smoothing basis Phi_s
+        # v[b, Z1, m] = sum_Q1 Wfn1[Q1, Z1, m] * z[b, Q1] + Bfn1[Z1, m]
         X1 = tf.einsum('b i, i d k -> b d k', h_dec, self.Wfn1) + self.Bfn1
         Y1 = tf.nn.elu(tf.matmul(X1, self.Phi_s))
+        # Layer 2
         w1 = tf.matmul(self.Wfn2, self.Phi_s)
         Y2_int = tf.einsum('b d k, d j k -> b j k', Y1, w1) + tf.reshape(self.Bfn2, (1, -1, 1))
         Y2_int = tf.nn.elu(Y2_int)
+        # Layer 3
         w2 = tf.matmul(self.Wfn3, self.Phi_s)
         Y2 = tf.einsum('b d k, d j k -> b j k', Y2_int, w2)
         return Y2
@@ -255,6 +260,8 @@ class FunctionalAutoencoder:
         """One-step encode-decode pass."""
         return self.decoder(self.encoder(x))
     
+    ## ---------------------------------------------------------------------
+    # --- loss functions ---
     @tf.function
     def loss_r(self, y_coeff, reconstruction):
         """
@@ -281,7 +288,7 @@ class FunctionalAutoencoder:
     @tf.function
     def loss_l2(self):
         """
-        L2 orthonormality penalty on encoder filters.
+        L2 orthonormality penalty on functional encoder filters.
         """
         # Compute Gram matrix C[j,k] = sum_{d,r,s} wfn[j,d,r] * B[r,s] * wfn[k,d,s]
         C = tf.einsum('jdr,rs,kds->jk', self.wfn, self.B, self.wfn)  # now shape [q1, q1]
@@ -292,7 +299,8 @@ class FunctionalAutoencoder:
         # diagonal penalty
         diag = tf.linalg.tensor_diag_part(C)
         on  = tf.reduce_sum((diag - 1.)**2) / q1
-        return off + on
+        L2 = off + on
+        return L2
     
     @tf.function
     def loss_l1(self):
@@ -300,25 +308,35 @@ class FunctionalAutoencoder:
         L1 sparsity penalty on all functional decoder weights & biases.
         """
         L1 = (
-            tf.reduce_sum(tf.abs(self.Wfn1)) / (self.Q1 * self.Z1 * self.m)
-            + tf.reduce_sum(tf.abs(self.Wfn2)) / (self.Z1 * self.Z2 * self.m)
-            + tf.reduce_sum(tf.abs(self.Wfn3)) / (self.Z2 * self.p * self.m)
-            + tf.reduce_sum(tf.abs(self.Bfn1)) / (self.Z1 * self.m)
-            + tf.reduce_sum(tf.abs(self.Bfn2)) / self.Z2
-        )
+              tf.reduce_sum(tf.abs(self.Wfn1)) / (self.Q1 * self.Z1 * self.m)
+              + tf.reduce_sum(tf.abs(self.Wfn2)) / (self.Z1 * self.Z2 * self.m)
+              + tf.reduce_sum(tf.abs(self.Wfn3)) / (self.Z2 * self.p * self.m)
+              + tf.reduce_sum(tf.abs(self.Bfn1)) / (self.Z1 * self.m)
+              + tf.reduce_sum(tf.abs(self.Bfn2)) / self.Z2
+             )
         return L1
     
     @tf.function
+    def loss_t(self, y_coeff, reconstruction):
+        """
+        Total autoencoder loss: reconstruction + L2 + L1 penalties.
+        """
+        return (
+                self.loss_r(y_coeff, reconstruction)
+                + self.lambda_e * self.loss_l2()
+                + self.lambda_d * self.loss_l1()
+               )
+    
+    ## ---------------------------------------------------------------------
+    @tf.function
     def clustering_loss(self, X_latent, cluster_labels):
         """
-        Compute clustering validation L_c over latent codes.
-
-        L_c = (2*within-cluster SSE - total SSE) / N
+        Clustering loss based on within-cluster dispersion vs. total dispersion.
 
         Parameters
         ----------
         X_latent : tf.Tensor, shape [N, latent_dim]
-            Latent codes for all samples.
+            Latent representations for all samples.
         cluster_labels : tf.Tensor, shape [N], dtype int32
             Discrete cluster assignment per sample.
 
@@ -356,24 +374,15 @@ class FunctionalAutoencoder:
         L_c = (2.0 * within_cluster_sse - total_sse) / N
         return L_c
     
-    @tf.function
-    def loss_t(self, y_coeff, reconstruction):
+    ## ---------------------------------------------------------------------
+    # --- network training --- 
+    def train(self, X_train, epochs, learning_rate, batch_size, neighbors_dict, sim_matrix, beta=0.9):
         """
-        Total autoencoder loss: reconstruction + L2 + L1 penalties.
-        """
-        return (
-            self.loss_r(y_coeff, reconstruction)
-            + self.lambda_e * self.loss_l2()
-            + self.lambda_d * self.loss_l1()
-        )
-
-    def train(self, X_train, epochs, learning_rate, batch_size, neighbors_dict, sim_matrix):
-        """
-        Train the Functional Autoencoder.
-
+        Train the Functional Autoencoder using mini-batch GD with momentum.
+        
         Alternates mini-batch reconstruction updates
         with a global convex clustering step each epoch.
-
+    
         Parameters
         ----------
         X_train : array_like or tf.Tensor, shape [N, p, l]
@@ -381,19 +390,27 @@ class FunctionalAutoencoder:
         epochs : int
             Number of training epochs.
         learning_rate : float
-            Learning rate for Adam optimizer.
+            Step size alpha.
         batch_size : int
             Mini-batch size.
         neighbors_dict : dict
             Adjacency for convex clustering.
         sim_matrix : array_like, shape [N,N]
             Similarity matrix for convex clustering.
+        beta : float, optional
+            Momentum coefficient (default 0.9).
         """
         num_samples = X_train.shape[0]
-        optimizer = tf.optimizers.Adam(learning_rate=learning_rate)
-        self.epoch_loss = []
         self.neighbors_dict = neighbors_dict
         self.sim_matrix = sim_matrix
+        all_vars = self.encoder_vars + self.decoder_vars
+        
+        # Initialize momentum buffers for reconstruction/reg updates
+        m = [tf.zeros_like(v) for v in all_vars]
+        # Separate buffer for encoder-only (clustering) updates
+        m_enc = [tf.zeros_like(v) for v in self.encoder_vars]
+        
+        self.epoch_loss = []
         
         for epoch in range(epochs):
             # Shuffle data indices for mini-batch sampling
@@ -401,51 +418,50 @@ class FunctionalAutoencoder:
             # Placeholder to store latent codes in original order
             X_reduced_full = np.empty((num_samples, self.s), dtype=np.float32)
             
-            # Mini-batch training loop
+            # --- Mini-batch loop ---
             for start in range(0, num_samples, batch_size):
                 end = min(start + batch_size, num_samples)
-                batch_idx = indices[start:end]                       # original indices for this batch
-                x_batch = X_train[batch_idx]                         # fetch batch data using shuffled indices
-
+                batch_idx = indices[start:end]
+                x_batch = X_train[batch_idx]
+                
+                # Compute gradients on total loss (recon + L2 + L1)
                 with tf.GradientTape() as tape:
-                    # Forward pass: encode and decode        
-                    latent = self.encoder(x_batch)                   # latent representation for batch
-                    recon  = self.decoder(latent)                    # reconstruction of x_batch
-                    # Total loss for this batch (excluding clustering loss, which is global)
-                    total_loss = self.loss_t(x_batch, recon)    
+                    # Forward pass: encode and decode 
+                    latent = self.encoder(x_batch)
+                    recon  = self.decoder(latent)
+                    total_loss = self.loss_t(x_batch, recon)
+                grads = tape.gradient(total_loss, all_vars)
                 
-                # Backprop reconstruction + regularization losses
-                grads = tape.gradient(total_loss, self.encoder_vars + self.decoder_vars)
-                optimizer.apply_gradients(zip(grads, self.encoder_vars + self.decoder_vars))
+                # Momentum update + parameter step
+                for i, (v, g) in enumerate(zip(all_vars, grads)):
+                    m[i] = beta * m[i] + (1. - beta) * g
+                    v.assign_sub(learning_rate * m[i])
                 
-                # Store this batch's latent vectors in the full array at original indices
+                # Store latents for clustering step
                 X_reduced_full[batch_idx] = latent.numpy()
             
-            # --- End of mini-batch loop for this epoch ---
-            
-            # Compute clustering on the full latent space (in original sample order):
-            # Use the encoder outputs collected in X_reduced_full (aligned to original indices)
+            # --- Clustering step (after each epoch) ---
             cluster = ConvexClustering(X_reduced_full, self.neighbors_dict, self.sim_matrix)
             cluster_labels = cluster.fit()
-            # Convert cluster labels to a Tensor for loss computation
             cluster_labels_tf = tf.constant(cluster_labels, dtype=tf.int32)
             
-            # Compute clustering loss and backprop only through encoder_vars
+            # Compute clustering‐loss gradients w.r.t. encoder_vars
             with tf.GradientTape() as tape:
                 X_latent_full = self.encoder(X_train)
                 L_c = self.clustering_loss(X_latent_full, cluster_labels_tf)
-                total_cluster_loss = self.lambda_c * L_c
+                cluster_loss = self.lambda_c * L_c
+            grads_enc = tape.gradient(cluster_loss, self.encoder_vars)
             
-            # Backpropagate the clustering loss to update encoder weights
-            cluster_grads = tape.gradient(total_cluster_loss, self.encoder_vars)
-            optimizer.apply_gradients(zip(cluster_grads, self.encoder_vars))
+            # Momentum update + step for encoder only
+            for i, (v, g) in enumerate(zip(self.encoder_vars, grads_enc)):
+                m_enc[i] = beta * m_enc[i] + (1. - beta) * g
+                v.assign_sub(learning_rate * m_enc[i])
             
-            # Logging the losses for monitoring
-            epoch_recon_loss = total_loss.numpy()  # last batch recon loss (or compute average over batches separately)
-            # epoch_cluster_loss = L_c.numpy()
-            self.epoch_loss.append(epoch_recon_loss)
-            # print(f"Epoch {epoch+1}: Loss = {epoch_recon_loss:.4f}")
+            # Log the last batch’s reconstruction loss
+            self.epoch_loss.append(float(total_loss.numpy()))
+            # print(f"Epoch {epoch+1}/{epochs} loss: {self.epoch_loss[-1]:.4f}")
     
+    ## ---------------------------------------------------------------------
     def predict(self, coeffs, batch_size = None):
         """
         Encode new data, then cluster latent codes.
@@ -481,6 +497,7 @@ class FunctionalAutoencoder:
         labels = cluster.fit()
         return latents.numpy(), labels
     
+    ## ---------------------------------------------------------------------
     def model_summary(self):
         """
         Print a summary of all trainable parameters.
@@ -525,5 +542,5 @@ class FunctionalAutoencoder:
         print("=" * 70)
         print(f"Total trainable parameters: {int(total_params)}")
         print("=" * 70)
-   
+        
 ## ------------------------------------------------------------------------- ##

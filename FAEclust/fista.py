@@ -2,6 +2,7 @@ import numpy as np
 from joblib import Parallel, delayed
 from sklearn.metrics import silhouette_score
 
+
 ## ------------------------------------------------------------------------- ##
 class ConvexClustering:
     """

@@ -5,6 +5,7 @@ from .srvf      import TimeSeriesDistance
 from .mnn       import NearestNeighborsOpt
 from .FAE       import FunctionalAutoencoder
 
+
 __all__ = [
     "smoothing_features", "bspline_basis", "load_dataset", "rescale",
     "DatasetGenerator",

@@ -67,7 +67,7 @@ print(f'{dataset_name}: pre-processing Time = {end - start:.2f} s')
 # 5. Initialize and train Functional Autoencoder (FAE)
 p = n_features                          # Input dimensionality
 # layers [functional, ... MLP ..., functional, functional, functional]
-layers = [32, 16, 8, 16, 32, 32, 32]    # Encoder/decoder layer units
+layers = [32, 16, 8, 16, 32, 32, 32]
 
 # Prepare B-spline basis for FAE model functional weights
 l_basis = 50                        # Number of functional weight basis functions
@@ -79,6 +79,7 @@ lambda_e, lambda_d, lambda_c = 0.5, 0.05, 0.5
 epochs = 100
 learning_rate = 1e-3
 batch_size = 16
+beta = 0.9
 
 # Create FAE instance with similarity constraints
 FAE_model = FunctionalAutoencoder(
@@ -100,7 +101,8 @@ FAE_model.train(
                 learning_rate=learning_rate,
                 batch_size=batch_size,
                 neighbors_dict=neighbors_dict,
-                sim_matrix=sim_matrix
+                sim_matrix=sim_matrix,
+                beta=beta
                 )
 end = time.time()
 print(f'{dataset_name}: network training Time = {end - start:.2f} s')

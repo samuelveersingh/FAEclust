@@ -106,6 +106,16 @@ class TimeSeriesDistance:
             gamma[i] = np.mean(self.times[js]) if js else self.times[i]
         # enforce monotonicity
         gamma = np.maximum.accumulate(gamma)
+        # normalize gamma to [0, 1] 
+        g0, g1 = float(gamma[0]), float(gamma[-1])
+        if g1 - g0 < 1e-12:
+            # Degenerate mapping; fall back to identity reparameterization
+            gamma = self.times.copy()
+        else:
+            gamma = (gamma - g0) / (g1 - g0)
+        # Ensure exact endpoints for stability with np.interp and gradient
+        gamma[0] = 0.0
+        gamma[-1] = 1.0
 
         # 4) Warp q2 by gamma and weight by sqrt(gamma')
         # Interpolate each feature of q2 at warped times
