@@ -1,3 +1,4 @@
+
 # FAEclust: Cluster Analysis of Multi-Dimensional Functional Data
 
 Highlights:
@@ -39,13 +40,13 @@ The modular pipeline for FAEclust has the following structure:
 ```python
 
 Smoothing(
-    dis_p, 		# number of grid points for evaluating functions 
-    fit, 		# basis function type: 'bspline', 'fourier', or Wavelet name 
-    n, 			# for Fourier: number of harmonics (2n+1 basis functions) 
+    dis_p, 			# number of grid points for evaluating functions 
+    fit, 			# basis function type: 'bspline', 'fourier', or Wavelet name 
+    n, 				# for Fourier: number of harmonics (2n+1 basis functions) 
     smoothing_str,	# initial smoothing parameter for B-splines if _terms_ is not given
-    terms, 		# number of basis terms/knots to use (if None, auto-optimize) 
+    terms, 			# number of basis terms/knots to use (if None, auto-optimize) 
     wavelet_level, 	# Wavelet decomposition level (for Wavelet fits) if _terms_ is not given
-    data = None  	# input data of shape (n_samples, n_timesteps)
+    data = None  	# input data of shape (n_samples, n_features, n_timesteps)
 ) 
 
 ```
@@ -56,7 +57,7 @@ Smoothing(
 
 -   **`fit`** _(str)_:  The type of basis expansion to use for smoothing. Options are the same as in `smoothing_features`: `'bspline'`, `'fourier'`, or a Wavelet name (e.g., `'db4'`).     _Default_: `'bspline'`
 
--   **`n`** _(int)_:  Applicable if `fit='fourier'`. It specifies the number of Fourier harmonics to include. The total number of Fourier basis functions will be $2n + 1$ (including the constant term, $n$ cosine terms, and $n$ sine terms). If `n=None`,  the smoothing is adaptive and Generalized Cross-Validation (GCV) is used to find the optimal number of harmonics up to `n` by GCV.    _Default_: `3` 
+-   **`n`** _(int)_:  Applicable if `fit='fourier'`. It specifies the number of Fourier harmonics to include. The total number of Fourier basis functions will be $2n + 1$ (including the constant term, $n$ cosine terms, and $n$ sine terms). If `n=None`,  the smoothing is adaptive and Generalized Cross-Validation (GCV) is used to find the optimal number of harmonics up to `n` by GCV.    _Default_: `None` 
 
 -   **`smoothing_str`** _(float)_:  Parameters for B-spline fitting. This is passed to the spline fitting routine (`scipy.interpolate.splrep()`) to control the trade-off between smoothness and fidelity: higher values yield smoother curves (more regularization), while _s_=0 fits the spline through all points (interpolation). If `terms` (number of knots/basis functions) is not specified for B-splines, this parameter is internally optimized via GCV.      _Default_: `0.3`
 
@@ -82,8 +83,8 @@ Smoothing(
 
 ```python
 TimeSeriesDistance(
-    X, 			# raw sample paths of shape (n_samples, n_features, n_timesteps)
-    metric,             # distance metric to use ('fastdtw' or 'elastic') 
+    X, 				# raw sample paths of shape (n_samples, n_features, n_timesteps)
+    metric,         # distance metric to use ('fastdtw' or 'elastic') 
     n_jobs  		# number of parallel jobs for computation 
 ) 
 ```
@@ -131,7 +132,7 @@ NearestNeighborsOpt(
     
 
 ### Methods
--   **`estimate_optimal_m(method='connectivity', max_m=None)`**: Select the optimal number of nearest neighbors.
+-   **`estimate_optimal_m(method='avg_distance', max_m=None)`**: Select the optimal number of nearest neighbors.
     -  **`method`** _(str)_ : Method to use for neighbourhood optimization. Options include:
 	    -  **`'avg_distance'`** _(default)_ : Find the $m$ at which the average _m_-th neighbor distance exhibits the largest jump or knee.
 	    -   **`'connectivity'`** : Find the smallest $m$ at which the _k_-NN graph is fully connected. 
@@ -152,8 +153,6 @@ NearestNeighborsOpt(
 
 
 
-
-
 ## Class: FunctionalAutoencoder
 
 FAEclust is a deep learning framework for clustering multivariate functional data. It integrates three key components: (1) functional data smoothing via basis function expansion (e.g. B-splines, Fourier series, Wavelet family, ...) to provide a smooth representation of each sample path, (2) a functional autoencoder consisting of an encoder for learning complex relationships among the features and a decoder for flexibly reconstructing intricate functional patterns, and (3) a shape-informed convex clustering algorithm that automatically determines the optimal number of clusters.  The `FunctionalAutoencoder` class is designed to handle these steps end-to-end,  while providing various hyperparameters to tailor the model to different datasets.
@@ -162,8 +161,8 @@ FAEclust is a deep learning framework for clustering multivariate functional dat
 FunctionalAutoencoder(
     p,                      # number of component random functions (dimensions)
     layers,                 # list specifying encoder/decoder layer width
-    l,                      # number of basis functions for encoder functional weights
-    m,                      # number of basis functions for smoothing the sample paths
+    l_basis,                # number of basis functions for encoder functional weights
+    m_basis,                # number of basis functions for smoothing the sample paths
     basis_smoothing,        # list of basis functions used for smoothing (e.g. Fourier basis)
     basis_input,            # list of basis functions for encoder functional weights (e.g. B-spline basis)
     lambda_e,               # penalty parameter for the orthogonality regularization on encoder functional weights
@@ -189,13 +188,13 @@ FunctionalAutoencoder(
         
     -   _`Q1, Z1, Z2`_ are the sizes of the last three layers of the decoder that output functions. 
         
--   **`l`** _(int)_ – Functional weights and biases are represented as linear combinations of basis functions. `l` is the number of basis functions for the functional weights in the encoder.
+-   **`l_basis`** _(int)_ – Functional weights and biases are represented as linear combinations of basis functions. `l_basis` is the number of basis functions for the functional weights in the encoder.
     
--   **`m`** _(int)_ – Number of basis functions used for converting the raw sample paths into smooth functions.
+-   **`m_basis`** _(int)_ – Number of basis functions used for converting the raw sample paths into smooth functions.
     
--   **`basis_smoothing`** _(list of callables)_ – A list of `m` basis functions (evaluated on the time grid `t`) for smoothing the raw sample paths. The provided utility `smoothing_features()` can generate this list along with the expansion coefficients.
+-   **`basis_smoothing`** _(list of callables)_ – A list of `m_basis` basis functions (evaluated on the time grid `t`) for smoothing the raw sample paths. Each basis function is a callable `basis_smoothing(x: array_like[T, p]) -> np.ndarray[T, p]`The provided utility `smoothing_features()` can generate this list along with the expansion coefficients.
     
--   **`basis_input`** _(list of callables)_ – A list of `l` basis functions (evaluated on the time grid `t`) for representing the functional weights in the encoder. 
+-   **`basis_input`** _(list of callables)_ – A list of `l_basis` basis functions (evaluated on the time grid `t`) for representing the functional weights in the encoder. Each basis function is a callable `basis_input(x: array_like[T, p]) -> np.ndarray[T, p]`. 
     
 -   **`lambda_e`** _(float)_ – Penalty parameter for the orthogonality regularization on encoder functional weights. The parameter controls the amount of regularization on encoder functional weights, encouraging within-component functional weights to be orthogonal.
     
@@ -205,7 +204,7 @@ FunctionalAutoencoder(
     
 -   **`t`** _(array-like of shape (T,))_ – Time grid (array of length T) over which the input functions, functional weights, functional biases and output functions are evaluated/defined. 
     
--   **`sim_matrix`** _(numpy.ndarray of shape (n_samples, n_samples))_ – The pairwise similarity matrix among the $$ sample paths, a term in the clustering objective function. The similarity matrix is essentially a weighted `m`-nearest neighbor graph, and the function `NearestNeighborsOpt()` will construct the graph with the optimal `m` value. 
+-   **`sim_matrix`** _(numpy.ndarray of shape (n_samples, n_samples))_ – The pairwise similarity matrix among the $N$ sample paths, a term in the clustering objective function. The similarity matrix is essentially a weighted `m`-nearest neighbor graph, and the function `NearestNeighborsOpt()` will construct the graph with the optimal `m` value. 
     
 
 ### Methods
@@ -218,9 +217,9 @@ FunctionalAutoencoder(
 	-   **`learning_rate`** _(float)_ – Learning rate of the training algorithm. A smaller value might be used if the loss oscillates or diverges, whereas a larger value could speed up convergence if the loss is stable. 		_Default_: `1e-3` 
     -   **`batch_size`** _(int)_ – The mini-batch size.	    _Default_: `16` 
     -   **`neighbors_dict`** _(dict)_   A dictionary mapping each data point to its `m` nearest neighbors. It is obtained from the `get_nearest_neighbors()` method. 
-    - **`sim_matrix`**_(numpy.ndarray of shape (n_samples, n_samples))_ – The pairwise similarity matrix among the $$ sample paths.
+    - **`sim_matrix`**_(numpy.ndarray of shape (n_samples, n_samples))_ – The pairwise similarity matrix among the $N$ sample paths.
 
-- **`predict(coeffs, batch_size=batch_size)`**: Return the embedded data and the cluster labels of the functional data.
+- **`predict(coeffs, batch_size)`**: Return the embedded data and the cluster labels of the functional data.
 	- **Returns**
 		- **`S`** _(np.ndarray, shape=(n_samples, s))_ : Array of the embedded data.
 		- **`labels`** _(np.ndarray, shape=(n_samples))_ : Functional data cluster labels.
@@ -233,8 +232,8 @@ FunctionalAutoencoder(
 ```python
 ConvexClustering(
     X, 				# embedded data of shape (n_samples, s) 
-    neighbors_dict, 		 
-    sim_matrix, 		# the pairwise similarity matrix
+    neighbors_dict, 	 
+    sim_matrix, 	# the pairwise similarity matrix
     verbose		  	# whether to print out the merging process and the Silhouette scores 
 )
 ```
