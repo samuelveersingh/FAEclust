@@ -1,16 +1,24 @@
 
 # FAEclust: Cluster Analysis of Multi-Dimensional Functional Data
 
-Highlights:
-
-* FAEclust is the first autoencoder architecture designed specifically for **clustering multi-dimensional functional data**. By using functional weights, it operates directly on functions rather than pointwise values, and its deep structure automatically captures complex dependencies among the component random functions.
-*  Both the encoder and decoder are **universal approximators**.
-* We introduce a shape-informed clustering objective that is **robust to phase variation** in functional data, and we develop a path-following homotopy algorithm with complexity O(n log(n)) to obtain the optimal clustering of the latent representations.
-
-In FAEclust, we employ univariate functions as weights instead of integral kernels:
+FAEclust is the first autoencoder architecture designed specifically for **clustering multi-dimensional functional data**. In FAEclust, we employ univariate functions as weights instead of integral kernels:
 
 1. Unlike traditional regression models, where integral kernels are used for functional predictors to capture full dependence, our encoder is designed to learn latent representations. Consequently, the univariate functions serve as a coordinate system in the Hilbert space.
 2. Using univariate functions not only reduces computational cost but also improves interpretability. In particular, the shape of the learned functional weights reveals which regions of the input functional data contribute most to the construction of the embedded representations.
+
+Both the encoder and decoder are **universal approximators**. We introduce a shape-informed clustering objective that is **robust to phase variation** in functional data, and we develop a path-following homotopy algorithm with complexity O(n log(n)) to obtain the optimal clustering of the latent representations. If you used this package in your research, please cite our [paper](https://arxiv.org/abs/2509.22969):
+```latex
+@inproceedings{SVS2025NeurIPS,
+ author = {Samuel Singh and Shirley Coyle and Mimi Zhang},
+ booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+ editor = { },
+ pages = { },
+ publisher = {Curran Associates, Inc.},
+ title = {Shape-Informed Clustering of Multi-Dimensional Functional Data via Deep Functional Autoencoders},
+ volume = { },
+ year = {2025}
+}
+```
 
 
 ## 🏗️ The joint network training and clustering framework.
@@ -270,6 +278,7 @@ In this example, we demonstrate FAEclust on the `"Plane"` dataset using a simila
 We compute the similarity matrix using FastDTW (`metric='fastdtw'`). After building the similarity matrix, we smooth each sample path with B-spline basis functions. The functional autoencoder is configured with the architecture: `[32, 16, 8, 16, 32, 32, 32]` which produces a latent representation of dimension 8. After 100 epochs, we obtain the final cluster labels.
 
 The above examples and parameters serve as a guide, but users are encouraged to experiment with the basis size (`l, m`), network depth (`layers`), and loss weights (`lambda_e, lambda_d, lambda_c`) to best fit their specific datasets.
+
 
 
 
