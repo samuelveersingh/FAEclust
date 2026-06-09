@@ -6,20 +6,11 @@ import networkx as nx
 ## ------------------------------------------------------------------------- ##
 class NearestNeighborsOpt:
     """
-    Determine optimal number of nearest neighbors (m) using:
-      1. Average m-th neighbor distance curve (sharp jump method)
-      2. Graph connectivity
-
-    Parameters
-    ----------
-    dist_matrix : array-like, shape (n_samples, n_samples)
-        Symmetric matrix of pairwise distances.
-    """
-    """
-    Determine an optimal number of nearest neighbors (m)
-    using two complementary approaches:
-      1. Average m-th neighbor distance curve (sharp jump detection)
-      2. Graph connectivity (first m yielding a single connected component)
+    Pick a good number of nearest neighbors (m) and build the neighbor graph
+    and similarity matrix from a distance matrix. Two ways to pick m:
+      1. Watch how the average distance to the m-th neighbor grows and find a
+         sharp jump.
+      2. Find the smallest m that links all points into one connected graph.
 
     Parameters
     ----------
@@ -157,15 +148,15 @@ class NearestNeighborsOpt:
             return int(ks[-1])
 
         elif method == 'avg_distance':
-            # Use sharp jump in average-distance curve
+            # Find where the average m-th-neighbor distance jumps up the most,
+            # measured as a relative jump and only over small m (m <= n//4).
+            # Limiting the search to small m avoids picking a huge m, which
+            # would connect almost every point and make clustering useless.
             ks, avg_dists = self.average_mth_distances(max_m)
-            # Identify the m where the increase (jump) in average distance is maximal
-            diffs = np.diff(avg_dists)
-            idx = np.argmax(diffs)      # index of largest jump
-            ## or the first sharp jump
-            # idx = np.where(diffs > 0.1*len(diffs))[0][0]
-            # idx corresponds to jump from m=ks[idx] to ks[idx+1]
-            return int(ks[idx+1])       # neighbor count where jump occurs
+            hi = max(2, min(len(ks) - 1, self.n_samples // 4))
+            rel = np.diff(avg_dists[:hi + 1]) / (avg_dists[:hi] + 1e-12)
+            idx = int(np.argmax(rel))
+            return int(ks[idx + 1])
 
         else:
             raise ValueError("method must be 'connectivity' or 'avg_distance'")
@@ -185,11 +176,9 @@ class NearestNeighborsOpt:
             Mapping i -> array of opt_m nearest neighbor indices.
         """
         if opt_m is None:
-            # auto-estimate m via avg_distance method
-            ks, avg_dists = self.average_mth_distances(max_m=150)
-            diffs = np.diff(avg_dists)
-            idx = np.argmax(diffs)
-            opt_m = int(ks[idx+1])
+            # pick m automatically from the average-distance jump
+            opt_m = self.estimate_optimal_m(method='avg_distance',
+                                            max_m=self.n_samples - 1)
             
         N = self.dist_matrix.shape[0]
         neighbors_dict = {}
@@ -202,18 +191,20 @@ class NearestNeighborsOpt:
     
     def compute_similarity(self, neighbors_dict, method='neighbors'):
         """
-        Compute a dense similarity matrix from distances.
+        Build a similarity matrix from the distances. Two points are similar
+        if either one is among the other's nearest neighbors, and closer points
+        (smaller distance) are more similar:
 
-        Two modes:
-        - 'neighbors': only neighbor edges have non-zero similarity.
-        - 'distance': all pairs weighted by a Gaussian kernel.
+            similarity(i, j) = (i and j are neighbors) * exp(-distance(i, j)).
 
         Parameters
         ----------
         neighbors_dict : dict[int, Sequence[int]]
-            Mapping i -> list of neighbor indices.
+            Mapping i -> indices of i's nearest neighbors.
         method : {'neighbors', 'distance'}
-            Similarity computation mode.
+            'neighbors' keeps only neighbor pairs (the default);
+            'distance' keeps exp(-distance) for all pairs (no neighbor filter),
+            with self-similarity set to zero.
 
         Returns
         -------
@@ -221,52 +212,23 @@ class NearestNeighborsOpt:
             Symmetric similarity matrix.
         """
         n = self.dist_matrix.shape[0]
-        # Build boolean mask for neighbor relationships
+        # Mark a pair as neighbors if either point lists the other as a neighbor
         mask = np.zeros((n, n), dtype=bool)
         for i, nbrs in neighbors_dict.items():
-            mask[i, nbrs] = True
-        mask |= mask.T          # make symmetric
+            mask[i, np.asarray(nbrs, dtype=int)] = True
+        mask |= mask.T
 
-        # Compute Gaussian similarities for all pairs
-        # sigma = np.median(self.dist_matrix)
-        sigma = np.std(self.dist_matrix)
-        sim = np.exp(- (self.dist_matrix ** 2) / (2 * sigma ** 2), out=np.empty_like(self.dist_matrix))
-        # sim = np.exp(- (self.dist_matrix))
+        # Turn distances into similarities: closer -> larger value
+        sim = np.exp(-self.dist_matrix)
+        np.fill_diagonal(sim, 0.0)
+
         if method == 'neighbors':
-            # Zero out non-neighbor pairs
-            sim[~mask] = 0
+            sim[~mask] = 0.0
             return sim
         elif method == 'distance':
-            # Keep all similarities, but zero out self-similarity
-            sim[np.eye(n, dtype=bool)] = 0
             return sim
         else:
             raise ValueError("method must be 'neighbors' or 'distance'")
             
 ## ------------------------------------------------------------------------- ##
 
-if __name__ == "__main__":
-    # Example usage: load data, compute distance matrix, and find optimal m
-    from aeon.datasets import load_classification
-    from srvf import TimeSeriesDistance          # custom TS distance calculator
-    
-    # Load classification dataset 'BME', get time-series X and labels y
-    X, y = load_classification('BME')
-    # Compute pairwise distances via fastDTW
-    tsd = TimeSeriesDistance(X, metric='fastdtw', n_jobs=-1)
-    D = tsd.compute_distances()
-
-    max_m = X.shape[0]-1
-    opt = NearestNeighborsOpt(D)
-    # Method 1: plot and estimate via average-distance jump
-    opt.plot_average_mth_distances(max_m=max_m)
-    k1 = opt.estimate_optimal_m(method='avg_distance', max_m=max_m)
-    print(f"Optimal m (avg_distance): {k1}")
-    neighbors_dict = opt.get_nearest_neighbors(opt_m=k1)
-    
-    # Method 2: plot and estimate via connectivity
-    opt.plot_connectivity(max_m=max_m)
-    k2 = opt.estimate_optimal_m(method='connectivity', max_m=max_m)
-    print(f"Optimal m (connectivity): {k2}")
-
-## ------------------------------------------------------------------------- ##

@@ -313,23 +313,138 @@ class DatasetGenerator:
             plt.show()
 
 ## ------------------------------------------------------------------------- ##
-if __name__ == '__main__':
-    output_dir = os.path.join(os.getcwd(), 'datasets')
-    os.makedirs(output_dir, exist_ok=True)
-    # specs: (dataset_name, n_samples, n_features, n_steps, n_clusters)
-    specs = [
-        ('hypersphere', 100, 3, 100, 2),
-        ('hyperbolic', 200, 2, 50, 2),
-        ('swiss_roll', 300, 2, 200, 4),
-        ('lorenz', 100, 3, 100, 3),
-        ('pendulum', 200, 2, 100, 4),
-    ]
-    for name, n_samples, n_features, n_steps, n_clusters in specs:
-        print(f"Generating {name}: ({n_samples}, {n_features}, {n_steps}, {n_clusters} clusters)")
-        gen = DatasetGenerator(n_samples, n_features, n_steps, n_clusters)
-        X, y = getattr(gen, f"generate_{name}")()
-        gen.plot_dataset(name)
-        # filepath = os.path.join(output_dir, f"{name}.csv")
-        # gen.save_dataset(X, y, filepath)
+## Maps that place flat (Euclidean) points onto a curved surface (manifold)
+## ------------------------------------------------------------------------- ##
+import tensorflow as tf
+
+
+def _sphere_exp(a, v, eps=1e-8):
+    """Move from anchor point a in the direction v, staying on the unit sphere.
+    a is a unit vector (..., p); v is the direction (..., p), projected so it
+    is tangent to the sphere at a. Returns the resulting point on the sphere."""
+    v = v - tf.reduce_sum(v * a, axis=-1, keepdims=True) * a    # keep direction tangent to the sphere
+    nv = tf.maximum(tf.norm(v, axis=-1, keepdims=True), eps)
+    return tf.cos(nv) * a + tf.sin(nv) * (v / nv)
+
+
+def _sphere_log(a, y, eps=1e-8):
+    """Inverse of _sphere_exp: from anchor a, find the tangent direction that
+    points toward another point y on the unit sphere (its length is the
+    distance along the sphere from a to y)."""
+    y = y / tf.maximum(tf.norm(y, axis=-1, keepdims=True), eps)
+    c = tf.clip_by_value(tf.reduce_sum(a * y, axis=-1, keepdims=True), -1 + 1e-7, 1 - 1e-7)
+    theta = tf.math.acos(c)
+    u = y - c * a
+    nu = tf.maximum(tf.norm(u, axis=-1, keepdims=True), eps)
+    return theta * u / nu
+
+
+def _poincare_exp0(v, eps=1e-8):
+    """Map a flat direction v into the Poincare disk/ball (a model of curved
+    hyperbolic space), starting from its center. Returns a point inside the
+    unit ball."""
+    nv = tf.maximum(tf.norm(v, axis=-1, keepdims=True), eps)
+    return tf.tanh(nv) * v / nv
+
+
+def _poincare_log0(y, eps=1e-8):
+    """Inverse of _poincare_exp0: map a point y inside the Poincare ball back
+    to a flat direction at the center."""
+    ny = tf.clip_by_value(tf.norm(y, axis=-1, keepdims=True), eps, 1 - 1e-6)
+    return tf.math.atanh(ny) * y / ny
+
+
+class ManifoldReadout:
+    """
+    Maps the decoder's flat (Euclidean) output onto a chosen curved surface
+    (manifold). It only holds constants and has no trainable weights, so it is
+    a plain class rather than a Keras layer. All operations are differentiable,
+    so gradients still flow through it during training when ``kind`` is set.
+
+    Parameters
+    ----------
+    kind : {None, 'euclidean', 'sphere', 'poincare'}
+        None / 'euclidean'  -> do nothing, return the input unchanged (flat data).
+        'sphere'            -> place points on the unit sphere, using an anchor
+                               point (the average position of the data).
+        'poincare'          -> place points inside the Poincare ball (a model of
+                               curved hyperbolic space), starting from its center.
+    anchors : array, optional, shape (A, p)
+        Optional anchor points. If None, a single anchor is used (set via
+        `fit_anchor`; defaults to the first coordinate axis for the sphere).
+
+    Calling the object maps V (batch, p, T) onto the surface, same shape out.
+    Use `to_tangent(Y)` for the reverse: turn points on the surface back into
+    flat coordinates that can be fed to the encoder.
+    """
+
+    def __init__(self, kind=None, anchors=None):
+        self.kind = (kind or 'euclidean')
+        if anchors is not None:
+            self.anchors = tf.constant(np.asarray(anchors, np.float32))
+        else:
+            self.anchors = None
+        self.anchor = None
+
+    # -- compute the anchor (average position) on the sphere ----------------
+    def fit_anchor(self, Y):
+        """
+        Find the average position (anchor) of the data points on the sphere.
+        Y has shape (n, p, T). Does nothing unless kind is 'sphere'.
+        """
+        if self.kind != 'sphere':
+            return self
+        Yt = tf.constant(np.asarray(Y), dtype=tf.float32)
+        v = tf.reshape(tf.transpose(Yt, [0, 2, 1]), [-1, Yt.shape[1]])   # (n*T, p)
+        v = v / tf.maximum(tf.norm(v, axis=-1, keepdims=True), 1e-8)
+        mu = tf.reduce_mean(v, axis=0)
+        for _ in range(50):                                  # repeatedly refine the average on the sphere
+            mu = mu / tf.maximum(tf.norm(mu), 1e-8)
+            a = tf.broadcast_to(mu, tf.shape(v))
+            tang = tf.reduce_mean(_sphere_log(a, v), axis=0)
+            mu = _sphere_exp(mu, tang)
+        self.anchor = mu / tf.maximum(tf.norm(mu), 1e-8)
+        return self
+
+    def _anchor_like(self, V):
+        p = V.shape[1]
+        if self.kind == 'sphere':
+            if self.anchor is not None:
+                return self.anchor
+            return tf.tensor_scatter_nd_update(tf.zeros([p]), [[0]], [1.0])
+        return None
+
+    # -- map flat points onto the curved surface ----------------------------
+    def __call__(self, V):
+        if self.kind in (None, 'euclidean'):
+            return V
+        Vp = tf.transpose(V, [0, 2, 1])                       # (b, T, p)
+        if self.kind == 'sphere':
+            a = tf.broadcast_to(self._anchor_like(V), tf.shape(Vp))
+            out = _sphere_exp(a, Vp)
+        elif self.kind == 'poincare':
+            out = _poincare_exp0(Vp)
+        else:
+            raise ValueError(f"unknown manifold kind {self.kind!r}")
+        return tf.transpose(out, [0, 2, 1])                   # (b, p, T)
+
+    # -- reverse: map points on the surface back to flat coordinates --------
+    def to_tangent(self, Y):
+        """Turn points lying on the curved surface back into flat coordinates
+        so they can be fed to the encoder."""
+        is_np = not tf.is_tensor(Y)
+        Yt = tf.constant(np.asarray(Y), dtype=tf.float32) if is_np else tf.cast(Y, tf.float32)
+        if self.kind in (None, 'euclidean'):
+            return Y
+        Yp = tf.transpose(Yt, [0, 2, 1])
+        if self.kind == 'sphere':
+            a = tf.broadcast_to(self._anchor_like(Yt), tf.shape(Yp))
+            out = _sphere_log(a, Yp)
+        elif self.kind == 'poincare':
+            out = _poincare_log0(Yp)
+        else:
+            raise ValueError(f"unknown manifold kind {self.kind!r}")
+        out = tf.transpose(out, [0, 2, 1])
+        return out.numpy() if is_np else out
 
 ## ------------------------------------------------------------------------- ##

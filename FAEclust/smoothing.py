@@ -6,59 +6,69 @@ from scipy.interpolate import BSpline, LSQUnivariateSpline
 ## ------------------------------------------------------------------------- ##
 class Smoothing:
     """
-    Fit smooth functional representations to discrete data using different bases.
+    Fit smooth curves to noisy, sampled data. Each row of the data is a series
+    of measurements, and this turns it into a smooth function you can evaluate
+    at any time. The smooth curve is built from simple building-block functions
+    (the "basis"): smooth piecewise polynomials (B-splines), sines and cosines
+    (Fourier), or wavelets.
 
     Parameters
     ----------
     dis_p : int
-        Number of evaluation points on the fine grid (default=300).
+        How many points to evaluate the fitted curve at when sampling it
+        finely (default=300).
     fit : {'bspline', 'fourier', 'wavelet'}
-        Basis type for smoothing.
+        Which kind of building-block functions to use.
     n : int
-        Number of Fourier terms (2n + 1 total basis functions).
+        Number of Fourier frequencies (giving 2n + 1 building blocks in total).
     smoothing_str : float
-        Smoothing parameter for B-spline fitting (used as penalty lambda in GCV search when terms is None).
+        How strongly to smooth a B-spline fit. When ``terms`` is None, it is
+        used as the starting scale while the smoothing strength is chosen
+        automatically.
     terms : int or None
-        Number of basis terms / knots (if None, optimized automatically via GCV).
+        Number of building blocks (knots). If None, a good number is chosen
+        automatically.
     wavelet_level : int
-        Decomposition level for wavelet basis (if None, optimized automatically via GCV).
+        How many levels of detail to use for a wavelet fit. If None, chosen
+        automatically.
     data : array-like, shape (N_samples, N_timepoints)
-        Input data matrix to fit.
+        The data to fit: one time series per row.
     """
     def __init__(self, 
                  dis_p=300,
                  fit='bspline',
-                 n=3,                     # number of fourier terms (2n+1)
-                 smoothing_str=0.3,       # used as initial scale for lambda grid when optimizing
+                 n=3,                     # number of Fourier frequencies (2n+1 building blocks)
+                 smoothing_str=0.3,       # starting scale for the smoothing strength when chosen automatically
                  terms=None,
-                 wavelet_level=4,         # resolution of wavelet fit
+                 wavelet_level=4,         # level of detail for a wavelet fit
                  data=None,
                  ):
         ## -----------------------------------------------------------------
-        # Store input settings
-        self.smoothing_str = smoothing_str  # treat this as a scale for lambda when GCV-optimizing
-        self.n = n              # Number of sine and cosine terms (if None -> pick by GCV via penalty)
-        self.dis_p = dis_p      # number of discrete points for evaluations
+        # Store the settings.
+        self.smoothing_str = smoothing_str  # also used as the starting scale when the smoothing strength is chosen automatically
+        self.n = n              # number of Fourier frequencies (if None, chosen automatically)
+        self.dis_p = dis_p      # how many points to sample the fitted curve at
         self.fit = fit
         self.wavelet_level = wavelet_level
         self.num_knots = terms
         self.data = data
-        
-        # Data dimensions and grids
+
+        # Set up the time axes the data lives on.
         self.data_size = self.data.shape[1]
-        self.t = np.linspace(0, 1, self.data_size)      # coarse grid
-        self.fine_t = np.linspace(0, 1, self.dis_p)     # fine grid for evaluation
+        self.t = np.linspace(0, 1, self.data_size)      # the times the data was measured at
+        self.fine_t = np.linspace(0, 1, self.dis_p)     # a denser set of times to evaluate the fitted curve at
 
         ## -----------------------------------------------------------------
-        # --- Model selection by fit type ---
+        # --- Build the fit, depending on which basis was chosen ---
         if self.fit == 'bspline':
             if self.num_knots is None:
-                # choose lambda by GCV and infer number of basis functions (terms)
+                # Choose the smoothing strength and number of building blocks
+                # automatically, then fit a smoothed B-spline.
                 self.smoothing_str, self.num_knots = self._gcv_bspline_penalty_and_terms()
-                # fit penalized bspline
                 self.fn_s = self._fit_bsplines_penalized()
             else:
-                # explicit number of terms => LSQ spline with those knots
+                # A fixed number of building blocks was given: fit a B-spline
+                # with that many evenly spaced knots by least squares.
                 self.degree = 3
                 knot_pos = np.linspace(0, 1, self.num_knots)
                 knots = np.concatenate(([0] * self.degree, knot_pos[1:-1], [1] * self.degree))
@@ -70,7 +80,7 @@ class Smoothing:
                     curves.append(spline)
                     self.coeffs.append(np.array(spline.get_coeffs()))
                 self.fn_s = curves
-                # also expose basis builder for parity with earlier API
+                # Also build the list of basis functions, for callers that need them.
                 def bspline_basis(num_basis=None, degree=3):
                     num_knots = num_basis + degree + 1
                     t_t = np.concatenate(([0] * degree, np.linspace(0, 1, num_knots - 2 * degree), [1] * degree))
@@ -83,42 +93,49 @@ class Smoothing:
                 self.smoothing_basis = bspline_basis(num_basis=self.num_knots)
 
         elif self.fit == 'fourier':
-            # If number of Fourier terms (n) was not provided, use GCV to pick a penalty and infer n.
+            # If the number of Fourier frequencies wasn't given, pick a good
+            # number automatically first.
             if self.n is None:
                 lam, eff_n = self._gcv_fourier_penalty_and_terms()
                 self.smoothing_str = lam
                 self.n = max(1, int(eff_n))
-            # In both cases, fit using the provided/inferred n WITHOUT GCV here.
+            # Fit using that number of frequencies.
             self.fn_s = self._fit_curves(basis='fourier')
 
         else:
-            # wavelet fit (fit holds a wavelet name, e.g. 'db4')
-            # If explicit wavelet_level is None -> use GCV to choose (level, threshold).
+            # Wavelet fit. Here ``fit`` holds a wavelet name such as 'db4'.
+            # If no level of detail was given, choose the level and the
+            # noise-removal threshold automatically.
             if self.wavelet_level is None:
                 self.wavelet_level, self.wavelet_threshold = self._gcv_wavelet_level_and_threshold()
-            # Fit once with provided or chosen level (and threshold if set).
+            # Fit using the chosen (or given) level and threshold.
             self.fn_s = self._fit_curves(basis=self.fit)
     
     ## ---------------------------------------------------------------------
-    # --- Utilities ---
+    # --- Helpers ---
 
     @staticmethod
     def _gcv_error(y_true, y_pred, df):
         """
-        Compute Generalized Cross-Validation (GCV) error.
-        Standard: GCV = n * RSS / (n - df)^2.
+        Score how well a fit matches the data while penalizing fits that use
+        too many building blocks, so we can compare settings and pick the best.
+        Lower is better. ``df`` measures roughly how many free parameters the
+        fit used. (This is the generalized cross-validation, or GCV, score:
+        n * sum-of-squared-errors / (n - df)^2.)
         """
         residual = y_true - y_pred
         n = len(y_true)
         rss = np.sum(residual**2)
-        # guard for df close to n
+        # Keep the denominator away from zero when df gets close to n.
         denom = max(1e-12, (n - df)) ** 2
         return n * rss / denom
 
     ## ---------------------------------------------------------------------
-    # --- B-Spline (penalized regression spline) ---
+    # --- B-spline (smooth piecewise-polynomial fit) ---
     def _bspline_design(self, x, num_basis, degree=3):
-        """Construct B-spline design matrix with equally-spaced internal knots on [0,1]."""
+        """Build the matrix of B-spline building-block functions evaluated at
+        the points ``x``, using evenly spaced knots on [0, 1]. Returns that
+        matrix and the list of building-block functions."""
         num_knots = num_basis + degree + 1
         t_t = np.concatenate(([0] * degree, np.linspace(0, 1, num_knots - 2 * degree), [1] * degree))
         basis = []
@@ -130,14 +147,18 @@ class Smoothing:
         return X, basis
 
     def _penalized_spline_fit(self, y, X, lam, order=2):
-        """Solve min ||y - Xb||^2 + lam * ||D b||^2  with D = finite-diff of given order."""
+        """Fit the data ``y`` with the building blocks in ``X``, adding a
+        penalty that discourages wiggly fits. ``lam`` controls how strong the
+        penalty is (larger means smoother). The penalty measures how much
+        neighbouring coefficients differ. Returns the fitted values and a
+        rough count of how many free parameters were used."""
         p = X.shape[1]
-        # Build difference operator D (p - order rows)
+        # Build the operator D that takes differences of the coefficients.
         D = np.zeros((max(0, p - order), p))
         for i in range(D.shape[0]):
-            # finite differences of given order
+            # Coefficients for a difference of the given order.
             coeff = np.zeros(order + 1)
-            # binomial coefficients with alternating signs
+            # Alternating-sign binomial coefficients.
             from math import comb
             for k in range(order + 1):
                 coeff[k] = ((-1)**(order - k)) * comb(order, k)
@@ -154,23 +175,26 @@ class Smoothing:
         return yhat, df
 
     def _gcv_bspline_penalty_and_terms(self):
-        """Select lambda (penalty) by GCV for several basis sizes; pick best basis size (terms)."""
-        # candidate number of basis functions (keep small to moderate to avoid overfitting)
+        """Try several numbers of building blocks and several smoothing
+        strengths, score each with the GCV measure, and return the smoothing
+        strength and number of building blocks that scored best."""
+        # Candidate numbers of building blocks (kept modest to avoid overfitting).
         nT = self.data_size
         candidates = np.unique(np.clip(np.array([6, 8, 10, 12, 15, 20, 25, 30]), 4, nT-1))
-        # lambda grid (log space around provided smoothing_str as scale)
+        # Range of smoothing strengths to try, spread across several orders of
+        # magnitude around the given starting scale.
         base = max(1e-4, float(self.smoothing_str))
         lam_grid = np.unique(np.concatenate([
             10.0**np.linspace(-6, 2, 20),
             base * 10.0**np.linspace(-3, 3, 13),
         ]))
 
-        best = (np.inf, None, None)  # gcv, lambda, K
+        best = (np.inf, None, None)  # best score so far, and its (smoothing strength, K)
         for K in candidates:
             X, basis = self._bspline_design(self.t, K, degree=3)
-            # precompute for speed
+            # Compute these once per K to save time inside the inner loop.
             XtX = X.T @ X
-            # difference penalty matrix for order=2
+            # Penalty matrix based on second differences of the coefficients.
             p = X.shape[1]
             D = np.zeros((max(0, p - 2), p))
             for i in range(D.shape[0]):
@@ -180,7 +204,6 @@ class Smoothing:
 
             for lam in lam_grid:
                 A = XtX + lam * P
-                # Precompute factorization
                 AinvXt = np.linalg.solve(A, X.T)
                 S = X @ AinvXt
                 df = np.trace(S)
@@ -193,15 +216,17 @@ class Smoothing:
                     best = (gcv_avg, lam, K)
 
         best_gcv, best_lam, best_K = best
-        # store chosen basis for later reuse
+        # Keep the chosen building blocks so they can be reused later.
         self._bspline_best_basis = self._bspline_design(self.t, int(best_K), degree=3)[1]
         return float(best_lam), int(best_K)
 
     def _fit_bsplines_penalized(self):
-        """Fit penalized regression spline with chosen lambda and basis size; return callable splines per row."""
+        """Fit a smoothed B-spline to each row using the chosen smoothing
+        strength and number of building blocks. Returns one callable curve per
+        row."""
         K = self.num_knots
         X, basis = self._bspline_design(self.t, K, degree=3)
-        # penalty (second differences)
+        # Penalty based on second differences of the coefficients.
         p = X.shape[1]
         D = np.zeros((max(0, p - 2), p))
         for i in range(D.shape[0]):
@@ -216,7 +241,8 @@ class Smoothing:
             beta = AinvXt @ row
             self.coeffs.append(beta.copy())
             yfine = np.column_stack([b(self.fine_t) for b in basis]) @ beta
-            # represent as a BSpline by fitting LSQ spline to the fine grid for convenience
+            # Wrap the densely-sampled fitted curve in a spline object so it is
+            # easy to evaluate later.
             spline = LSQUnivariateSpline(self.fine_t, yfine, t=np.linspace(0,1,max(2, K-4))[1:-1], k=3) if K>4 else \
                      LSQUnivariateSpline(self.fine_t, yfine, t=[], k=3)
             curves.append(spline)
@@ -224,9 +250,11 @@ class Smoothing:
         return curves
     
     ## ---------------------------------------------------------------------
-    # --- Fourier (frequency-penalized ridge) ---
+    # --- Fourier (sums of sines and cosines) ---
     def _fourier_design(self, x, max_n):
-        """Design matrix with columns: 1, cos(2π j x), sin(2π j x) for j=1..max_n."""
+        """Build the matrix of Fourier building blocks evaluated at the points
+        ``x``: a constant column plus cos(2*pi*j*x) and sin(2*pi*j*x) for each
+        frequency j from 1 to max_n."""
         cols = [np.ones_like(x)]
         for j in range(1, max_n + 1):
             cols.append(np.cos(2*np.pi*j*x))
@@ -236,27 +264,31 @@ class Smoothing:
 
     def _gcv_fourier_penalty_and_terms(self, m=2):
         """
-        Choose lambda for Fourier ridge with frequency penalty w_j proportional to (2π j)^{2m}.
-        Return (lambda, effective n terms) where effective terms ~ round((df-1)/2).
+        Pick a good smoothing strength for a Fourier fit by trying several and
+        scoring each with the GCV measure. Higher frequencies are penalized
+        more, which favours smoother curves. Returns the chosen smoothing
+        strength and a sensible number of frequencies to keep.
         """
-        max_n = min(50, (self.data_size - 1)//2)  # cap to avoid huge designs
+        max_n = min(50, (self.data_size - 1)//2)  # cap the number of frequencies so the matrices stay small
         X = self._fourier_design(self.t, max_n)
         p = X.shape[1]
 
-        # Penalty matrix P: 0 for intercept, and same weight for cos/sin of frequency j.
+        # Penalty weights: none for the constant term, and a weight that grows
+        # with frequency for each cosine/sine pair, so higher frequencies are
+        # smoothed away more strongly.
         P = np.zeros((p, p))
         idx = 1
         for j in range(1, max_n + 1):
             w = (2*np.pi*j)**(2*m)
-            P[idx, idx] = w       # cos
-            P[idx+1, idx+1] = w   # sin
+            P[idx, idx] = w       # cosine term
+            P[idx+1, idx+1] = w   # sine term
             idx += 2
 
         XtX = X.T @ X
         base = max(1e-6, float(self.smoothing_str))
         lam_grid = np.unique(np.concatenate([10.0**np.linspace(-8, 4, 25), base * 10.0**np.linspace(-4, 4, 17)]))
 
-        best = (np.inf, None, None)  # gcv, lambda, df
+        best = (np.inf, None, None)  # best score so far, and its (smoothing strength, df)
         for lam in lam_grid:
             A = XtX + lam * P
             AinvXt = np.linalg.solve(A, X.T)
@@ -271,29 +303,34 @@ class Smoothing:
                 best = (gcv_avg, lam, df)
 
         _, best_lam, best_df = best
-        eff_n = max(1, int(round(max(0.0, best_df - 1) / 2.0)))  # subtract intercept df, 2 dof per frequency
+        # Turn the effective number of parameters into a frequency count: one
+        # for the constant term, then two (a cosine and a sine) per frequency.
+        eff_n = max(1, int(round(max(0.0, best_df - 1) / 2.0)))
         return float(best_lam), eff_n
 
     def _fit_fourier(self, x, a0, an, bn):
-        """Reconstruct signal at points x using Fourier coefficients."""
+        """Evaluate a Fourier curve at points ``x`` from its coefficients
+        (the constant ``a0`` and the cosine/sine coefficients ``an``/``bn``)."""
         y = a0 * np.ones_like(x)
         for n, (a, b) in enumerate(zip(an, bn), start=1):
             y += a * np.cos(2 * np.pi * n * x) + b * np.sin(2 * np.pi * n * x)
         return y
 
     def _fourier_coefficients(self, data, T, n):
-        """Compute truncated Fourier series coefficients for one-dimensional data."""
+        """Find the Fourier coefficients of one time series, keeping only the
+        first ``n`` frequencies."""
         N = len(data)
         fft_output = np.fft.fft(data)
         a0 = fft_output[0].real / N
-        # real and imag to cos/sin
+        # Convert the FFT's real and imaginary parts into cosine/sine coefficients.
         an = 2 * fft_output.real[1:N//2] / N
         bn = -2 * fft_output.imag[1:N//2] / N
         return a0, an[:n], bn[:n]
-    
+
     def fourier_basis(self):
         """
-        Generate callable Fourier basis functions [1, cos1, sin1, ..., cos n, sin n].
+        Build the list of Fourier building-block functions you can call:
+        [constant, cos1, sin1, ..., cos n, sin n].
         """
         bases = [lambda x: np.ones_like(x)]
         for k in range(1, self.n + 1):
@@ -302,17 +339,20 @@ class Smoothing:
         return bases
     
     ## ---------------------------------------------------------------------
-    # --- Wavelet (thresholding with GCV over tau & level) ---
+    # --- Wavelet (smoothing by zeroing out small detail coefficients) ---
     def _count_nonzero_coeffs(self, coeffs):
         count = 0
         for c in coeffs:
             if isinstance(c, tuple) or isinstance(c, list):
-                # pywt return tuples of detail coeffs by axis; flatten
+                # Detail coefficients can come grouped; turn them into one array.
                 c = np.asarray(c)
             count += np.count_nonzero(c)
         return count
 
     def _threshold_coeffs(self, coeffs, tau, mode='soft'):
+        # Shrink wavelet coefficients toward zero, dropping ones smaller than
+        # the threshold ``tau``. This removes noise (small wiggles) and keeps
+        # the larger, meaningful features.
         thr = []
         for c in coeffs:
             arr = np.asarray(c)
@@ -320,20 +360,22 @@ class Smoothing:
         return thr
 
     def _recompose_like_input(self, coeffs, wavelet):
+        # Rebuild a curve from its wavelet coefficients.
         rec = pywt.waverec(coeffs, wavelet)
-        # If self.data has multiple rows, pywt.wavedec/rec expects per-row application.
-        # We'll apply along axis=1 (time) for each row.
         return rec
 
     def _gcv_wavelet_level_and_threshold(self, wavelet_name=None):
         """
-        Search over levels and thresholds; choose by GCV. 
-        df = # nonzero coeffs after thresholding.
+        Try several levels of detail and several noise thresholds, score each
+        with the GCV measure, and return the best level and threshold. Here the
+        number of free parameters is the count of coefficients left after
+        thresholding.
         """
-        wavelet = wavelet_name or self.fit  # allow string like 'db4'
+        wavelet = wavelet_name or self.fit  # e.g. a name like 'db4'
         max_lev = min(self.wavelet_level if self.wavelet_level else 6, pywt.dwt_max_level(self.data_size, pywt.Wavelet(wavelet).dec_len))
         levels = range(1, max_lev + 1)
-        # robust noise scale estimate using MAD from finest detail of first sample
+        # Estimate the noise level from the finest detail of the first series,
+        # using a robust spread measure so a few outliers don't throw it off.
         sigma_ref = None
         best = (np.inf, None, None)
         for lev in levels:
@@ -343,9 +385,9 @@ class Smoothing:
                 if sigma_ref is None and len(coeffs) > 1:
                     d1 = coeffs[-1]
                     sigma_ref = np.median(np.abs(d1 - np.median(d1))) / 0.6745 + 1e-12
-                # build a reasonable tau grid per level
+                # Build a range of thresholds to try for this level.
             tau_grid = np.linspace(0.5, 3.5, 8) * (sigma_ref if sigma_ref is not None else 1.0)
-            # evaluate per tau averaging over samples
+            # Score each threshold, averaging over all the series.
             for tau in tau_grid:
                 gcv_sum = 0.0
                 df_sum = 0.0
@@ -354,45 +396,47 @@ class Smoothing:
                     thr = self._threshold_coeffs(coeffs, tau, mode='soft')
                     df = self._count_nonzero_coeffs(thr)
                     yhat = pywt.waverec(thr, wavelet)
-                    # length align (waverec may differ by 1 sample depending on boundary)
+                    # Rebuilt curve can be one point longer; trim to match.
                     yhat = yhat[:len(row)]
                     gcv_sum += self._gcv_error(row, yhat, df)
                     df_sum += df
                 gcv_avg = gcv_sum / len(self.data)
                 if gcv_avg < gbest[0]:
                     gbest = (gcv_avg, tau)
-            # keep best tau for this level
+            # Remember the best threshold found at this level.
             if gbest[0] < best[0]:
                 best = (gbest[0], lev, gbest[1])
         best_gcv, best_level, best_tau = best
         return int(best_level), float(best_tau)
     
     ## ---------------------------------------------------------------------
-    # --- fit dispatcher ---
+    # --- choose and run the right fitting routine ---
     def _fit_curves(self, basis=None):
         """
-        Fit curves using specified basis type ('bspline', 'fourier', or wavelet name).
+        Fit a curve to each row of the data using the chosen building blocks
+        ('bspline', 'fourier', or a wavelet name).
 
         Returns
         -------
-        fn_s : list of callables or BSpline objects
-            Fitted curve functions for each data row.
+        fn_s : list
+            One fitted curve (a callable function or spline object) per data row.
         """
-        if basis == 'bspline':            
-            # handled in __init__
+        if basis == 'bspline':
+            # Already fitted in __init__.
             return self.fn_s
         elif basis == 'fourier':
             fn_s = []; T = 1; coeff = []
             for i in range(len(self.data)):
                 a0, an, bn = self._fourier_coefficients(self.data[i], T, self.n)
-                # pack coefficients as [a0, cos1, sin1, cos2, sin2, ...] length 2n+1
+                # Store the coefficients in one flat array, ordered as
+                # [constant, cos1, sin1, cos2, sin2, ...], length 2n+1.
                 packed = np.empty(1 + 2*self.n, dtype=float)
                 packed[0] = a0
                 for k in range(self.n):
                     packed[1 + 2*k]     = an[k]
                     packed[1 + 2*k + 1] = bn[k]
                 coeff.append(packed)
-                # closure for evaluation from packed coeffs
+                # Make a function that evaluates this curve from its coefficients.
                 def make_fn(p):
                     def f(x):
                         y = p[0] * np.ones_like(x)
@@ -404,11 +448,12 @@ class Smoothing:
                     return f
                 fn_s.append(make_fn(packed))
             self.coeffs = np.vstack(coeff)
-            # Fourier basis with the same ordering
+            # The Fourier building blocks, in the same order as the coefficients.
             self.smoothing_basis = self.fourier_basis()
             return fn_s
         else:
-            # wavelet path: use chosen level & (if found) threshold; df counts nonzero coeffs
+            # Wavelet fit: break each series into wavelet coefficients, drop the
+            # small (noise) ones, and rebuild a smooth curve.
             wavelet = basis
             fn_s = []
             self.coeffs = []
@@ -417,13 +462,14 @@ class Smoothing:
                 if hasattr(self, "wavelet_threshold"):
                     thr = self._threshold_coeffs(coeffs, self.wavelet_threshold, mode='soft')
                 else:
-                    # fallback: mild threshold based on MAD
+                    # No threshold was chosen, so estimate the noise level and
+                    # use a mild threshold based on it.
                     d1 = coeffs[-1]
                     sigma = np.median(np.abs(d1 - np.median(d1))) / 0.6745 + 1e-12
                     thr = self._threshold_coeffs(coeffs, 2.0 * sigma, mode='soft')
                 self.coeffs.append(thr)
                 reconstructed = pywt.waverec(thr, wavelet)[:len(row)]
-                # wrap into a smooth BSpline for easy evaluation
+                # Wrap the rebuilt curve in a spline so it is easy to evaluate.
                 t0 = np.linspace(0,1,len(reconstructed))
                 spline = LSQUnivariateSpline(t0, reconstructed, t=np.linspace(0,1,max(2, len(reconstructed)//8))[1:-1], k=3) \
                          if len(reconstructed) > 12 else LSQUnivariateSpline(t0, reconstructed, t=[], k=3)
@@ -432,89 +478,3 @@ class Smoothing:
 
 ## ------------------------------------------------------------------------- ##
 
-if __name__ == "__main__":
-    # --- Tests ---
-    import matplotlib.pyplot as plt
-
-    rng = np.random.default_rng(42)
-    N_samples = 10
-    T = 256
-    t = np.linspace(0, 1, T)
-
-    # Ground-truth signal: smooth periodic + low-frequency trend + small kink
-    def true_signal(x):
-        return 0.6*np.sin(2*np.pi*2*x) + 0.3*np.cos(2*np.pi*3*x) + 0.5*(x-0.5)**2
-
-    Y = np.vstack([true_signal(t) for _ in range(N_samples)])
-    noise = 0.15 * rng.standard_normal(size=Y.shape)
-    Y_noisy = Y + noise
-
-    # Helper to plot one fit
-    def plot_fit(ax, title, t, y_true, y_noisy, fn):
-        ax.plot(t, y_noisy, lw=1, alpha=0.5, label="noisy")
-        # evaluate on a fine grid for smooth curve
-        fine_t = np.linspace(0, 1, 600)
-        try:
-            y_fit = fn(fine_t)
-        except TypeError:
-            # fn is a callable returning values, e.g., lambda x: ...
-            y_fit = fn(fine_t)
-        ax.plot(fine_t, y_fit, lw=2, label="fit")
-        ax.plot(t, y_true, lw=1, ls="--", label="true")
-        ax.set_title(title)
-        ax.legend(loc="best")
-
-    # --- B-spline ---
-    # (A) terms=None -> choose lambda via GCV, infer number of basis terms, then fit
-    sm_bs_gcv = Smoothing(fit='bspline', terms=None, smoothing_str=0.3, data=Y_noisy)
-    # (B) explicit terms -> skip GCV
-    sm_bs_exp = Smoothing(fit='bspline', terms=12, data=Y_noisy)
-
-    # --- Fourier ---
-    # (A) n=None -> choose frequency penalty via GCV, infer effective n, then fit
-    sm_ft_gcv = Smoothing(fit='fourier', n=None, smoothing_str=0.1, data=Y_noisy)
-    # (B) explicit n -> skip GCV
-    sm_ft_exp = Smoothing(fit='fourier', n=5, data=Y_noisy)
-
-    # --- Wavelet ---
-    # Use a Daubechies wavelet name in 'fit'
-    wave_name = 'db4'
-    # (A) level=None -> choose (level, threshold) via GCV
-    sm_wv_gcv = Smoothing(fit=wave_name, wavelet_level=None, data=Y_noisy)
-    # (B) explicit level -> skip GCV (still applies a mild MAD-based soft threshold if no threshold stored)
-    sm_wv_exp = Smoothing(fit=wave_name, wavelet_level=4, data=Y_noisy)
-
-    # --- Plot results on first sample ---
-    fig, axes = plt.subplots(3, 2, figsize=(11, 10), sharex=True)
-    i = 0  # sample index
-
-    # B-spline
-    plot_fit(axes[0,0], f"B-spline (GCV: terms={sm_bs_gcv.num_knots}, λ≈{sm_bs_gcv.smoothing_str:.3g})",
-             t, Y[i], Y_noisy[i], sm_bs_gcv.fn_s[i])
-    plot_fit(axes[0,1], "B-spline (explicit terms=12)",
-             t, Y[i], Y_noisy[i], sm_bs_exp.fn_s[i])
-
-    # Fourier
-    # For plotting Fourier, create a closure that uses the chosen coefficients
-    def fourier_callable(sm, idx):
-        a0, an, bn = sm.coeffs[idx]
-        return lambda x: sm._fit_fourier(x, a0, an, bn)
-
-    plot_fit(axes[1,0], f"Fourier (GCV: n={sm_ft_gcv.n}, λ≈{sm_ft_gcv.smoothing_str:.3g})",
-             t, Y[i], Y_noisy[i], fourier_callable(sm_ft_gcv, i))
-
-    plot_fit(axes[1,1], "Fourier (explicit n=5)",
-             t, Y[i], Y_noisy[i], fourier_callable(sm_ft_exp, i))
-
-    # Wavelet
-    plot_fit(axes[2,0], f"Wavelet {wave_name} (GCV: level={sm_wv_gcv.wavelet_level}, τ≈{getattr(sm_wv_gcv,'wavelet_threshold',np.nan):.3g})",
-             t, Y[i], Y_noisy[i], sm_wv_gcv.fn_s[i])
-    plot_fit(axes[2,1], f"Wavelet {wave_name} (explicit level=4)",
-             t, Y[i], Y_noisy[i], sm_wv_exp.fn_s[i])
-
-    for ax in axes[-1]:
-        ax.set_xlabel("t")
-    plt.suptitle("Smoothing tests: B-spline, Fourier, Wavelet (first sample)")
-    plt.show()
-    
-## ------------------------------------------------------------------------- ##

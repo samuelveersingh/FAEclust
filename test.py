@@ -1,122 +1,66 @@
-# Functional Autoencoder Clustering on real Datasets
-# ----------------------------------------------------
-# This script loads a time series dataset from UCR repository, 
-# computes pairwise distances, builds an m-NN graph,
-# and trains a functional autoencoder to cluster the data.
-# Evaluation uses AMI and ARI clustering metrics.
-import numpy as np
-from aeon.datasets import load_classification
-from sklearn.metrics.cluster import adjusted_mutual_info_score, adjusted_rand_score
-import time 
+# Example: cluster the real UCR "Plane" time-series dataset with FAEclust.
 
-# Import custom modules for functional autoencoder clustering
+import numpy as np
+import time
+from sklearn.metrics.cluster import adjusted_mutual_info_score, adjusted_rand_score
+
 from FAEclust import (
-    smoothing_features,
-    bspline_basis,
-    rescale,
-    TimeSeriesDistance,
-    NearestNeighborsOpt,
-    FunctionalAutoencoder,
+    smoothing_features, bspline_basis, rescale,
+    TimeSeriesDistance, NearestNeighborsOpt, FunctionalAutoencoder,
 )
 
-
-## ------------------------------------------------------------------------- ##
-# Start preprocessing timing
 start = time.time()
-## --------------------------------------------------------------------- ##
-# 1. Load and preprocess dataset
+
+# 1. Load dataset -----------------------------------------------------------
 dataset_name = 'Plane'
+from aeon.datasets import load_classification
 X, y = load_classification(dataset_name)
-
-# Standardise data for network stability and extract labels as int32 
 X, y = rescale(np.array(X), y, dataset_name)
-# ground truth labels (y) are only used for evaluating AMI and ARI 
 
-## --------------------------------------------------------------------- ##
-# 2. Compute pairwise distance matrix using FastDTW
+# 2. Pairwise distance between curves (fast DTW) ----------------------------
 n_samples, n_features, n_timesteps = X.shape
-tsd = TimeSeriesDistance(X, metric='fastdtw', n_jobs=-1)
-D = tsd.compute_distances()
+D = TimeSeriesDistance(X, metric='fastdtw', n_jobs=-1).compute_distances()
 
-## --------------------------------------------------------------------- ##
-# 3. Build m-nearest-neighbor graph and similarity matrix
-# Estimate optimal m (number of neighbors) by average distance
+# 3. Nearest-neighbor graph + similarity ------------------------------------
+# Pick the smallest number of neighbors that keeps the graph connected,
+# capped at n//5 to keep the graph sparse (using too many neighbors hurts
+# clustering).
 opt = NearestNeighborsOpt(D)
-m = opt.estimate_optimal_m(method='avg_distance', max_m=X.shape[0]-1)
-print(f"Optimal m (avg_distance): {m}")
-
-# Retrieve neighbor indices and compute similarity
-neighbors_dict = opt.get_nearest_neighbors(opt_m= m)
+m_con = opt.estimate_optimal_m(method='connectivity', max_m=X.shape[0] - 1)
+m = int(max(5, min(m_con, X.shape[0] // 5)))
+print(f"nearest-neighbor graph size m={m} (connectivity, capped at n//5)")
+neighbors_dict = opt.get_nearest_neighbors(opt_m=m)
 sim_matrix = opt.compute_similarity(neighbors_dict)
 
-## --------------------------------------------------------------------- ##
-# 4. Smooth and extract functional features via B-splines
-m_basis = 50                    # Number of smoothing basis functions
-dis_p = 300                     # Number of discretization points (grid)
-t = np.linspace(0, 1, dis_p)    # Generate time grid
-# Compute coefficients and smoothed curves
+# 4. Smoothing (B-spline) with functional standardization -------------------
+m_basis, dis_p = 50, 300
+t = np.linspace(0, 1, dis_p)
 coeffs, curves, basis_smoothing = smoothing_features(
-                                        X, m=m_basis, dis_p=dis_p, fit='bspline'
-                                        )
+    X, m=m_basis, dis_p=dis_p, fit='bspline', standardize=True)
+print(f'{dataset_name}: pre-processing Time = {time.time() - start:.2f} s')
 
-# Report preprocessing time
-end = time.time()
-print(f'{dataset_name}: pre-processing Time = {end - start:.2f} s')
-
-## --------------------------------------------------------------------- ##
-# 5. Initialize and train Functional Autoencoder (FAE)
-p = n_features                          # Input dimensionality
-# layers [functional, ... MLP ..., functional, functional, functional]
+# 5. Train ------------------------------------------------------------------
+p = n_features
 layers = [32, 16, 8, 16, 32, 32, 32]
-
-# Prepare B-spline basis for FAE model functional weights
-l_basis = 50                        # Number of functional weight basis functions
+l_basis = 50
 basis_input = bspline_basis(num_basis=l_basis)
 
-# Regularization hyperparameters
-lambda_e, lambda_d, lambda_c = 0.5, 0.05, 0.5
-# Training settings
-epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-beta = 0.9
+model = FunctionalAutoencoder(
+    p, layers, l=l_basis, m=m_basis,
+    basis_smoothing=basis_smoothing, basis_input=basis_input,
+    lambda_e=0.5, lambda_d=0.05, lambda_c=0.5,
+    t=t, sim_matrix=sim_matrix, tau=0.9, use_bn=True, manifold=None)
+model.model_summary()
 
-# Create FAE instance with similarity constraints
-FAE_model = FunctionalAutoencoder(
-                                  p, layers, l=l_basis, m=m_basis,
-                                  basis_smoothing=basis_smoothing,
-                                  basis_input=basis_input,
-                                  lambda_e=lambda_e, lambda_d=lambda_d, lambda_c=lambda_c,
-                                  t=t, sim_matrix=sim_matrix
-                                  )
-
-# Display model architecture summary
-FAE_model.model_summary()
-
-# Train the model and measure training time
 start = time.time()
-FAE_model.train(
-                coeffs,
-                epochs=epochs,
-                learning_rate=learning_rate,
-                batch_size=batch_size,
-                neighbors_dict=neighbors_dict,
-                sim_matrix=sim_matrix,
-                beta=beta
-                )
-end = time.time()
-print(f'{dataset_name}: network training Time = {end - start:.2f} s')
+model.train_model(
+    coeffs, epochs=100, learning_rate=1e-3, batch_size=16,
+    neighbors_dict=neighbors_dict, sim_matrix=sim_matrix, beta=0.9,
+    pretrain_epochs=30, criterion='silhouette', verbose=False)
+print(f'{dataset_name}: network training Time = {time.time() - start:.2f} s')
 
-## --------------------------------------------------------------------- ##
-# 6. Cluster assignments and evaluate metrics
-S, labels = FAE_model.predict(coeffs, batch_size=batch_size)
-# S is the latent representation of each sample (number of samples, latent space dimension)
-ami = adjusted_mutual_info_score(y, labels)
-ari = adjusted_rand_score(y, labels)
-
-print(f'AMI score: {ami:.4f}')
-print(f'ARI score: {ari:.4f}')
+# 6. Evaluate ---------------------------------------------------------------
+S, labels = model.predict(coeffs, batch_size=16)
+print(f'AMI score: {adjusted_mutual_info_score(y, labels):.4f}')
+print(f'ARI score: {adjusted_rand_score(y, labels):.4f}')
 print(f'Number of clusters predicted: {len(np.unique(labels))}')
-
-## ------------------------------------------------------------------------- ##
-## ------------------------------------------------------------------------- ##

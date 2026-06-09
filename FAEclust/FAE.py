@@ -1,546 +1,420 @@
-import tensorflow as tf
-from .fista import ConvexClustering   # convex clustering algorithm
+"""TensorFlow/Keras functional autoencoder with joint convex clustering.
+
+Key design points:
+
+* MLP layers run in the order fully-connected -> batch normalization ->
+  ELU activation -> dropout (with keep-probability tau).
+* The decoder's functional-weight penalty is a 2nd-order roughness penalty:
+  the L1 norm of the 2nd difference of the basis-expansion coefficients. This
+  discourages wiggly reconstructed functions.
+* The clustering loss is normalised by ``n * s`` (number of samples times the
+  latent dimension).
+* A single backward step over all parameters minimises the combined loss
+  ``L = L_r + lambda_w L_w + lambda_c L_c`` (reconstruction + weight penalty +
+  clustering).
+* Training first pre-trains on the penalized reconstruction loss, then
+  fine-tunes with the clustering term added.
+* The optimizer is a manual mini-batch SGD-with-momentum loop inside a
+  ``tf.GradientTape`` (not a Keras optimizer / model.fit).
+* Optional non-trainable manifold readout rho applied to the decoder output.
+
+Implementation note: this uses Keras layers for the MLP blocks (so batch
+normalization and dropout come for free) and raw ``tf.Variable`` +
+``tf.einsum`` for the functional layers. Neither ``tf.Module`` nor
+``keras.layers.Layer`` collects both kinds of variable automatically, so this
+is a plain Python class with an explicit ``trainable_variables`` property.
+"""
+
 import numpy as np
+import tensorflow as tf
+import keras
+from keras import layers as klayers
+
+from .fista import ConvexClustering
+from .manifolds import ManifoldReadout
 
 
-## ------------------------------------------------------------------------- ##
+def pick_device(device=None):
+    """Resolve a TF device string: explicit -> /GPU:0 if available -> /CPU:0."""
+    if device is not None:
+        return device if isinstance(device, str) else str(device)
+    gpus = tf.config.list_physical_devices('GPU')
+    return '/GPU:0' if gpus else '/CPU:0'
+
+
+# --------------------------------------------------------------------------- #
+class _MLP:
+    """Dense stack: fully-connected -> batch norm -> ELU -> dropout per block.
+
+    Built from Keras layers but kept as a plain holder (not a Layer/Model) so
+    the parent class can assemble the full list of trainable variables by hand.
+    ``__call__`` passes the ``training`` flag into every batch-norm and dropout
+    layer, since those behave differently during training and evaluation.
+    """
+
+    def __init__(self, dims, tau=1.0, use_bn=True, name='mlp'):
+        self.blocks = []
+        for i, (a, b) in enumerate(zip(dims[:-1], dims[1:])):
+            dense = klayers.Dense(b, name=f'{name}_fc{i}')
+            # epsilon=1e-5 is the small constant added for numerical stability
+            # in batch normalization. We keep Keras' default momentum=0.99 for
+            # smooth moving statistics: the eval-mode embedding is what the
+            # convex clustering sees, and smooth moving averages keep it stable
+            # across cluster refreshes (a faster momentum=0.9 made it collapse
+            # to a single cluster).
+            bn = (klayers.BatchNormalization(epsilon=1e-5, name=f'{name}_bn{i}')
+                  if use_bn else None)
+            elu = klayers.ELU(name=f'{name}_elu{i}')
+            drop = klayers.Dropout(rate=1.0 - tau, name=f'{name}_do{i}') if tau < 1.0 else None
+            self.blocks.append((dense, bn, elu, drop))
+
+    def __call__(self, x, training=False):
+        for dense, bn, elu, drop in self.blocks:
+            x = dense(x)
+            if bn is not None:
+                x = bn(x, training=training)
+            x = elu(x)
+            if drop is not None:
+                x = drop(x, training=training)
+        return x
+
+    @property
+    def trainable_variables(self):
+        v = []
+        for dense, bn, _, _ in self.blocks:
+            v += list(dense.trainable_variables)
+            if bn is not None:
+                v += list(bn.trainable_variables)
+        return v
+
+    @property
+    def non_trainable_variables(self):
+        v = []
+        for _, bn, _, _ in self.blocks:
+            if bn is not None:
+                v += list(bn.non_trainable_variables)
+        return v
+
+
 class FunctionalAutoencoder:
-    """
-    A joint functional-autoencoder with clustering in the latent space.
+    """Functional autoencoder with a clustering-aware latent space.
 
-    Parameters
-    ----------
-    p : int
-        Dimensionality of the input (e.g., number of spatial locations/features).
-    layers : list of int
-        Architecture specification:
-            [q1, q2, ..., s, ..., Q2, Q1, Z1, Z2]
-        - q1: number of functional weights in encoder layer
-        - q2,...,s: sizes of successive dense encoder layers
-        - ...,Q2,Q1: sizes of successive dense decoder layers
-        - Z1,Z2: number of functional weights in decoder layers
-    l : int
-        Number of basis functions for encoder expansion.
-    m : int
-        Number of basis functions for smoothing expansion.
-    basis_smoothing : list of callables representing functions
-        Each callable maps time grid t to a smoothing basis vector of length T.
-    basis_input : list of callables representing functions
-        Each callable maps time grid t to an input basis vector of length T.
-    lambda_e : float
-        Weight of L2 orthonormality penalty on encoder filters.
-    lambda_d : float
-        Weight of L1 sparsity penalty on decoder filters.
-    lambda_c : float
-        Weight of clustering loss in latent space.
-    t : array_like, shape (T,)
-        Time grid over which functional data are defined.
-    sim_matrix : array_like, shape (N, N)
-        Pairwise similarity matrix for convex clustering.
+    Main parameters: p, layers, l, m, basis_smoothing, basis_input, lambda_e,
+    lambda_d, lambda_c, t, sim_matrix, plus:
+
+    tau : float in (0, 1], dropout keep-probability for MLP layers (1.0 = off).
+    use_bn : bool, whether to use batch normalization in the MLP layers.
+    manifold : {None,'euclidean','sphere','poincare'}, decoder readout rho.
     """
-    def __init__(
-        self,
-        p,
-        layers,
-        l,
-        m,
-        basis_smoothing,
-        basis_input,
-        lambda_e,
-        lambda_d,
-        lambda_c,
-        t,
-        sim_matrix
-    ):
-        ## -----------------------------------------------------------------
-        # --- Store basic properties ---
-        self.p = p              # input FD dimensions
+
+    def __init__(self, p, layers, l, m, basis_smoothing, basis_input,
+                 lambda_e, lambda_d, lambda_c, t, sim_matrix,
+                 tau=1.0, use_bn=True, manifold=None, seed=0):
+        tf.random.set_seed(seed)
+        self.seed = seed
+        self.p = p
         self.layers = layers
-        # Extract sizes for first and final functional dims
         self.q1 = layers[0]
         self.Z1 = layers[-2]
         self.Z2 = layers[-1]
-
-        # Extract dense (MLP) layer sizes, excluding first and last three functional dims
-        dense_dims = layers[1:-2]  # includes q2,...,s,...,Q2
-        # Split into encoder vs. decoder halves
-        N = len(dense_dims)
-        mid = N // 2
-        # encoder dense dims: q2,...,s
-        self.encoder_dense_dims = dense_dims[:mid] 
-        # decoder dense dims: ...,Q2
+        dense_dims = layers[1:-2]
+        mid = len(dense_dims) // 2
+        self.encoder_dense_dims = dense_dims[:mid]
         self.decoder_dense_dims = dense_dims[mid:]
-
-        # Other hyperparameters
-        self.l = l          # input basis count
-        self.m = m          # smoothing basis count
-        self.s = self.encoder_dense_dims[-1]  # final encoder latent space size
+        self.l = l
+        self.m = m
+        self.s = self.encoder_dense_dims[-1]
         self.lambda_e = lambda_e
         self.lambda_d = lambda_d
         self.lambda_c = lambda_c
-        self.basis_smoothing = basis_smoothing
-        self.basis_input = basis_input
-        self.t = t          # time grid
-        # Similarity matrix tensor for clustering
-        self.W = tf.convert_to_tensor(sim_matrix)
 
-        # Precompute basis matrices:
-        # Phi_s: [m, T], smoothing bases
-        # Phi_i: [l, T], input bases
-        self.Phi_s = tf.cast(tf.stack([b(self.t) for b in basis_smoothing], axis=0), tf.float32)  
-        self.Phi_i = tf.cast(tf.stack([g(self.t) for g in basis_input], axis=0), tf.float32)
-        
-        # Gram matrices A and B for functional operations
-        T = tf.cast(tf.shape(self.Phi_s)[1], tf.float32)
-        self.A = tf.matmul(self.Phi_s, self.Phi_i, transpose_b=True) / T  # [m, l]
-        self.B = tf.matmul(self.Phi_i, self.Phi_i, transpose_b=True) / T  # [l, l]
+        t = np.asarray(t, dtype=np.float32)
+        Phi_s = np.stack([np.asarray(b(t), np.float32) for b in basis_smoothing], 0)  # [m,T]
+        Phi_i = np.stack([np.asarray(g(t), np.float32) for g in basis_input], 0)      # [l,T]
+        T = Phi_s.shape[1]
+        # Non-trainable buffers as tf.constant (never enter trainable_variables).
+        self.t = tf.constant(t)
+        self.Phi_s = tf.constant(Phi_s)
+        self.Phi_i = tf.constant(Phi_i)
+        self.A = tf.constant(Phi_s @ Phi_i.T / T)   # [m,l]
+        self.B = tf.constant(Phi_i @ Phi_i.T / T)   # [l,l]
+        self.W = tf.constant(np.asarray(sim_matrix, np.float32))
 
-        # --- Functional encoder parameters ---
-        self.wfn = tf.Variable(
-            tf.random.uniform(
-                [self.q1, self.p, self.l],
-                minval=-np.sqrt(6 / (self.q1 + self.p)),
-                maxval=np.sqrt(6 / (self.q1 + self.p))
-            ),
-            dtype=tf.float32,
-            name="wfn"
-        )
-        self.bfn = tf.Variable(tf.zeros([self.q1]), name="bfn")
+        # functional encoder weights (Glorot-uniform initialization)
+        lim = np.sqrt(6.0 / (self.q1 + self.p))
+        self.wfn = tf.Variable(tf.random.uniform([self.q1, self.p, self.l], -lim, lim),
+                               name='wfn')
+        self.bfn = tf.Variable(tf.zeros([self.q1]), name='bfn')
 
-        # --- Dense encoder (MLP) parameters ---
-        self.W_dense_enc = []
-        self.b_dense_enc = []
-        prev_dim = self.q1
-        count = 0
-        for dim in self.encoder_dense_dims:
-            count += 1
-            W = self.glorot_uniform_init([prev_dim, dim], name=f"W_enc_{count}")
-            b = tf.Variable(tf.zeros([dim]), name=f"b_enc_{count}")
-            self.W_dense_enc.append(W)
-            self.b_dense_enc.append(b)
-            prev_dim = dim
+        # MLP encoder / decoder
+        enc_dims = [self.q1] + list(self.encoder_dense_dims)
+        self.enc_mlp = _MLP(enc_dims, tau=tau, use_bn=use_bn, name='enc')
+        dec_dims = [self.s] + list(self.decoder_dense_dims)
+        self.dec_mlp = _MLP(dec_dims, tau=tau, use_bn=use_bn, name='dec')
+        self.Q1 = dec_dims[-1]
 
-        # --- Dense decoder (MLP) parameters ---
-        self.W_dense_dec = []
-        self.b_dense_dec = []
-        prev_dim = self.encoder_dense_dims[-1]  # or self.s
-        # decoder dense dims are already split; we assume they include the mirror of encoder
-        for dim in self.decoder_dense_dims:
-            W = self.glorot_uniform_init([prev_dim, dim], name=f"W_dec_{count}")
-            b = tf.Variable(tf.zeros([dim]), name=f"b_dec_{count}")
-            self.W_dense_dec.append(W)
-            self.b_dense_dec.append(b)
-            prev_dim = dim
-            count -= 1
-        # The very last decoder MLP output
-        self.Q1 = prev_dim
+        # functional decoder (3 functional layers, with functional biases)
+        l1 = np.sqrt(6.0 / (self.Q1 + self.Z1))
+        self.Wfn1 = tf.Variable(tf.random.uniform([self.Q1, self.Z1, self.m], -l1, l1),
+                                name='Wfn1')
+        self.Bfn1 = tf.Variable(tf.zeros([self.Z1, self.m]), name='Bfn1')
+        l2 = np.sqrt(6.0 / (self.Z1 + self.Z2))
+        self.Wfn2 = tf.Variable(tf.random.uniform([self.Z1, self.Z2, self.m], -l2, l2),
+                                name='Wfn2')
+        self.Bfn2 = tf.Variable(tf.zeros([self.Z2]), name='Bfn2')
+        l3 = np.sqrt(6.0 / (self.Z2 + self.p))
+        self.Wfn3 = tf.Variable(tf.random.uniform([self.Z2, self.p, self.m], -l3, l3),
+                                name='Wfn3')
 
-        # --- Functional decoder parameters ---
-        # Three functional layers with learnable weights and biases
-        self.Wfn1 = tf.Variable(tf.random.uniform(
-                                    [self.Q1, self.Z1, self.m],
-                                    minval=-np.sqrt(6 / (self.Q1 + self.Z1)),
-                                    maxval=np.sqrt(6 / (self.Q1 + self.Z1))
-                                ),
-                                dtype=tf.float32,
-                                name="Wfn1")
-        self.Bfn1 = tf.Variable(tf.zeros([self.Z1, self.m]), name="Bfn1")
-        
-        self.Wfn2 = tf.Variable(tf.random.uniform(
-                                    [self.Z1, self.Z2, self.m],
-                                    minval=-np.sqrt(6 / (self.Z1 + self.Z2)),
-                                    maxval=np.sqrt(6 / (self.Z1 + self.Z2))
-                                ),
-                                dtype=tf.float32,
-                                name="Wfn2")
-        self.Bfn2 = tf.Variable(tf.zeros([self.Z2]), name="Bfn2")
-        
-        self.Wfn3 = tf.Variable(tf.random.uniform(
-                                    [self.Z2, self.p, self.m],
-                                    minval=-np.sqrt(6 / (self.Z2 + self.p)),
-                                    maxval=np.sqrt(6 / (self.Z2 + self.p))
-                                ),
-                                dtype=tf.float32,
-                                name="Wfn3")
+        self.readout = ManifoldReadout(manifold)
+        self.device = None
 
-        # Collect trainable variables
-        self.encoder_vars = [self.wfn, self.bfn] + self.W_dense_enc + self.b_dense_enc
-        self.decoder_vars = self.W_dense_dec + self.b_dense_dec + [
-                            self.Wfn1, self.Bfn1, self.Wfn2, self.Bfn2, self.Wfn3
-                            ]
-        ## -----------------------------------------------------------------
-    ## --------------------------------------------------------------------- 
-    # --- helper function for initializing MLP variables ---
-    def glorot_uniform_init(self, shape, name):
-        """
-        Glorot uniform initializer for a weight matrix.
+        # Build the Keras MLP blocks so their variables exist before the first
+        # trainable_variables access (Keras layers are lazily built on call).
+        self.enc_mlp(tf.zeros([1, self.q1]), training=False)
+        self.dec_mlp(tf.zeros([1, self.s]), training=False)
 
-        Parameters
-        ----------
-        shape : tuple (fan_in, fan_out)
-            Dimensions of the weight matrix.
-        name : str
-            TensorFlow variable name.
+    # -- variable tracking (load-bearing) -----------------------------------
+    @property
+    def trainable_variables(self):
+        return ([self.wfn, self.bfn]
+                + self.enc_mlp.trainable_variables
+                + self.dec_mlp.trainable_variables
+                + [self.Wfn1, self.Bfn1, self.Wfn2, self.Bfn2, self.Wfn3])
 
-        Returns
-        -------
-        tf.Variable
-            Initialized with uniform(-limit, +limit), where limit = sqrt(6/(fan_in+fan_out)).
-        """
-        fan_in, fan_out = shape
-        limit = np.sqrt(6 / (fan_in + fan_out))
-        return tf.Variable(tf.random.uniform(shape, minval=-limit, maxval=limit),
-                           name=name,
-                           dtype=tf.float32)
-    
-    ## ---------------------------------------------------------------------
-    # --- Functional Autoencoder (FAE) network ---
-    @tf.function
-    def encoder(self, x):
-        """
-        Encode input FD represented as coefficients into a latent vector.
-
-        Parameters
-        ----------
-        x : tf.Tensor, shape [batch, p, l]
-            Input coefficients in the input basis.
-
-        Returns
-        -------
-        tf.Tensor, shape [batch, s]
-            Latent representation after functional + MLP encoding.
-        """
-        # Functional filter application and basis contraction:
-        #   x1[b,q] = sum_{d,k,l} wfn[q,d,l] * A[k,l] * x[b,d,k]
-        x1 = tf.einsum('q d l, k l, b d k -> b q', self.wfn, self.A, x) + self.bfn
+    # -- forward -------------------------------------------------------------
+    def encoder(self, x, training=False):
+        x1 = tf.einsum('qdl,kl,bdk->bq', self.wfn, self.A, x) + self.bfn
         h = tf.nn.relu(x1)
-        # Pass through each dense encoder layer
-        for W, b in zip(self.W_dense_enc, self.b_dense_enc):
-            h = tf.matmul(h, W) + b
-            h = tf.nn.elu(h)
-        return h
+        return self.enc_mlp(h, training=training)
 
-    @tf.function
-    def decoder(self, h):
-        """
-        Decode latent vector back to functional output.
-
-        Parameters
-        ----------
-        h : tf.Tensor, shape [batch, s]
-            Latent codes from encoder.
-
-        Returns
-        -------
-        tf.Tensor, shape [batch, p, T]
-            Reconstructed functional signals over time grid.
-        """
-        # Dense decoder MLP 
-        z = h
-        for W, b in zip(self.W_dense_dec, self.b_dense_dec):
-            z = tf.nn.elu(tf.matmul(z, W) + b)
-        h_dec = z       # shape [batch, Q1]
-        
-        # Functional decoding: three-layer tensor contractions
-        # Layer 1: z -> [Z1, m], combine with smoothing basis Phi_s
-        # v[b, Z1, m] = sum_Q1 Wfn1[Q1, Z1, m] * z[b, Q1] + Bfn1[Z1, m]
-        X1 = tf.einsum('b i, i d k -> b d k', h_dec, self.Wfn1) + self.Bfn1
-        Y1 = tf.nn.elu(tf.matmul(X1, self.Phi_s))
-        # Layer 2
+    def decoder(self, h, training=False):
+        z = self.dec_mlp(h, training=training)                 # [b, Q1]
+        X1 = tf.einsum('bi,idk->bdk', z, self.Wfn1) + self.Bfn1
+        Y1 = tf.nn.elu(tf.matmul(X1, self.Phi_s))              # [b,Z1,T]
         w1 = tf.matmul(self.Wfn2, self.Phi_s)
-        Y2_int = tf.einsum('b d k, d j k -> b j k', Y1, w1) + tf.reshape(self.Bfn2, (1, -1, 1))
-        Y2_int = tf.nn.elu(Y2_int)
-        # Layer 3
+        Y2 = tf.einsum('bdk,djk->bjk', Y1, w1) + tf.reshape(self.Bfn2, (1, -1, 1))
+        Y2 = tf.nn.elu(Y2)
         w2 = tf.matmul(self.Wfn3, self.Phi_s)
-        Y2 = tf.einsum('b d k, d j k -> b j k', Y2_int, w2)
-        return Y2
-    
-    @tf.function
-    def forward(self, x):
-        """One-step encode-decode pass."""
-        return self.decoder(self.encoder(x))
-    
-    ## ---------------------------------------------------------------------
-    # --- loss functions ---
-    @tf.function
-    def loss_r(self, y_coeff, reconstruction):
-        """
-        Reconstruction MSE loss.
+        out = tf.einsum('bdk,djk->bjk', Y2, w2)                # [b,p,T]
+        return self.readout(out)
 
-        Parameters
-        ----------
-        y_coeff : tf.Tensor, shape [batch, p, l]
-            True input coefficients.
-        reconstruction : tf.Tensor, shape [batch, p, T]
-            Decoder output over time grid.
+    def forward(self, x, training=False):
+        return self.decoder(self.encoder(x, training=training), training=training)
 
-        Returns
-        -------
-        tf.Tensor
-            Scalar MSE * dt.
-        """
-        # y_coeff: [batch, p, m], reconstruction: [batch, p, T]
-        y = tf.matmul(y_coeff, self.Phi_s)       # [batch, p, T]
-        dt = self.t[1] - self.t[0]
-        # sum over all p and T, then multiply dt
-        return dt * tf.reduce_sum((y - reconstruction) ** 2)
-    
-    @tf.function
-    def loss_l2(self):
-        """
-        L2 orthonormality penalty on functional encoder filters.
-        """
-        # Compute Gram matrix C[j,k] = sum_{d,r,s} wfn[j,d,r] * B[r,s] * wfn[k,d,s]
-        C = tf.einsum('jdr,rs,kds->jk', self.wfn, self.B, self.wfn)  # now shape [q1, q1]
-        q1 = tf.cast(self.q1, tf.float32)
-        # off‐diagonal penalty
+    __call__ = forward
+
+    # -- losses --------------------------------------------------------------
+    def loss_r(self, y_coeff, recon):
+        y = tf.matmul(y_coeff, self.Phi_s)                     # [b,p,T]
+        return tf.reduce_mean((y - recon) ** 2)
+
+    def loss_orth(self):
+        C = tf.einsum('jdr,rs,kds->jk', self.wfn, self.B, self.wfn)
+        q1 = float(self.q1)
         mask = tf.eye(self.q1)
-        off = tf.reduce_sum((C * (1. - mask))**2) / (q1 * (q1 - 1) / 2)
-        # diagonal penalty
-        diag = tf.linalg.tensor_diag_part(C)
-        on  = tf.reduce_sum((diag - 1.)**2) / q1
-        L2 = off + on
-        return L2
-    
-    @tf.function
-    def loss_l1(self):
-        """
-        L1 sparsity penalty on all functional decoder weights & biases.
-        """
-        L1 = (
-              tf.reduce_sum(tf.abs(self.Wfn1)) / (self.Q1 * self.Z1 * self.m)
-              + tf.reduce_sum(tf.abs(self.Wfn2)) / (self.Z1 * self.Z2 * self.m)
-              + tf.reduce_sum(tf.abs(self.Wfn3)) / (self.Z2 * self.p * self.m)
-              + tf.reduce_sum(tf.abs(self.Bfn1)) / (self.Z1 * self.m)
-              + tf.reduce_sum(tf.abs(self.Bfn2)) / self.Z2
-             )
-        return L1
-    
-    @tf.function
-    def loss_t(self, y_coeff, reconstruction):
-        """
-        Total autoencoder loss: reconstruction + L2 + L1 penalties.
-        """
-        return (
-                self.loss_r(y_coeff, reconstruction)
-                + self.lambda_e * self.loss_l2()
-                + self.lambda_d * self.loss_l1()
-               )
-    
-    ## ---------------------------------------------------------------------
-    @tf.function
-    def clustering_loss(self, X_latent, cluster_labels):
-        """
-        Clustering loss based on within-cluster dispersion vs. total dispersion.
+        off = tf.reduce_sum((C * (1.0 - mask)) ** 2) / (q1 * (q1 - 1) / 2)
+        diag = tf.linalg.diag_part(C)
+        on = tf.reduce_sum((diag - 1.0) ** 2) / q1
+        return off + on
 
-        Parameters
-        ----------
-        X_latent : tf.Tensor, shape [N, latent_dim]
-            Latent representations for all samples.
-        cluster_labels : tf.Tensor, shape [N], dtype int32
-            Discrete cluster assignment per sample.
+    @staticmethod
+    def _rough(c):
+        """L1 norm of the 2nd difference along the basis-coefficient axis.
 
-        Returns
-        -------
-        tf.Tensor
-            Scalar clustering loss.
+        This is a roughness penalty: it is large when neighbouring coefficients
+        change abruptly, and small when they vary smoothly.
         """
-        # Number of data samples
-        N = tf.shape(X_latent)[0]
-        N = tf.cast(N, tf.float32)
-        # Determine number of clusters (assumes cluster_labels are integer IDs 0,...,K-1)
-        num_clusters = tf.reduce_max(cluster_labels) + 1
-        
-        # Compute cluster means u_k for each cluster k
-        cluster_means = tf.math.unsorted_segment_mean(
-            X_latent, cluster_labels, num_segments=num_clusters)
-        
-        # Compute global mean of all latent points
-        global_mean = tf.reduce_mean(X_latent, axis=0)
-        
-        # Compute sum of squared distances of points to their cluster mean (within-cluster dispersion)
-        # For each sample i, get its cluster mean u_{c_i}:
-        means_per_point = tf.gather(cluster_means, cluster_labels)    # shape [N, latent_dim]
-        diff_to_cluster = X_latent - means_per_point                  # differences x_i - u_{c_i}
-        sq_dist_to_cluster = tf.reduce_sum(tf.square(diff_to_cluster), axis=1)  # ||x_i - u_ci||^2 for each i
-        within_cluster_sse = tf.reduce_sum(sq_dist_to_cluster)        #  sum_k sum_{i in C_k} ||x_i - u_k||^2
-        
-        # Compute sum of squared distances of points to global mean (total dispersion)
-        diff_to_global = X_latent - global_mean                       # difference x_i - x_bar
-        sq_dist_to_global = tf.reduce_sum(tf.square(diff_to_global), axis=1)  # ||x_i - x_bar||^2 for each i
-        total_sse = tf.reduce_sum(sq_dist_to_global)                  #  sum_i ||x_i - x_bar||^2
-        
-        # Clustering loss: (2 * within_cluster_SSE - total_SSE) / N
-        L_c = (2.0 * within_cluster_sse - total_sse) / N
-        return L_c
-    
-    ## ---------------------------------------------------------------------
-    # --- network training --- 
-    def train(self, X_train, epochs, learning_rate, batch_size, neighbors_dict, sim_matrix, beta=0.9):
+        d2 = c[..., :-2] - 2.0 * c[..., 1:-1] + c[..., 2:]
+        return tf.reduce_mean(tf.abs(d2))
+
+    def loss_rough(self):
+        return (self._rough(self.Wfn1) + self._rough(self.Wfn2)
+                + self._rough(self.Wfn3) + self._rough(self.Bfn1)
+                + tf.reduce_mean(tf.abs(self.Bfn2)))
+
+    def clustering_loss(self, X, labels):
+        N = tf.cast(tf.shape(X)[0], tf.float32)
+        s = X.shape[1]
+        labels = tf.cast(labels, tf.int32)
+        K = int(tf.reduce_max(labels).numpy()) + 1
+        means = tf.math.unsorted_segment_mean(X, labels, num_segments=K)
+        within = tf.reduce_sum((X - tf.gather(means, labels)) ** 2)
+        total = tf.reduce_sum((X - tf.reduce_mean(X, axis=0)) ** 2)
+        return (2.0 * within - total) / (N * s)                # divide by n*s
+
+    @staticmethod
+    def clustering_loss_cached(Xb, labels_b, means, global_mean):
+        """Clustering loss on a minibatch.
+
+        Uses the cluster centroids (``means``) and the global mean cached from
+        the last full clustering pass. These are treated as constants while
+        optimising the network parameters, so they are passed in already
+        wrapped in tf.stop_gradient.
         """
-        Train the Functional Autoencoder using mini-batch GD with momentum.
-        
-        Alternates mini-batch reconstruction updates
-        with a global convex clustering step each epoch.
-    
-        Parameters
-        ----------
-        X_train : array_like or tf.Tensor, shape [N, p, l]
-            Training input coefficients.
-        epochs : int
-            Number of training epochs.
-        learning_rate : float
-            Step size alpha.
-        batch_size : int
-            Mini-batch size.
-        neighbors_dict : dict
-            Adjacency for convex clustering.
-        sim_matrix : array_like, shape [N,N]
-            Similarity matrix for convex clustering.
-        beta : float, optional
-            Momentum coefficient (default 0.9).
+        B = tf.cast(tf.shape(Xb)[0], tf.float32)
+        s = Xb.shape[1]
+        within = tf.reduce_sum((Xb - tf.gather(means, labels_b)) ** 2)
+        total = tf.reduce_sum((Xb - global_mean) ** 2)
+        return (2.0 * within - total) / (B * s)
+
+    def penalized_recon(self, y_coeff, recon):
+        return (self.loss_r(y_coeff, recon)
+                + self.lambda_e * self.loss_orth()
+                + self.lambda_d * self.loss_rough())
+
+    # -- training ------------------------------------------------------------
+    def _make_steps(self, params, mom, lr, beta):
+        """Build the per-minibatch SGD-with-momentum update functions.
+
+        Returns two functions: ``pretrain_step`` (reconstruction loss only) and
+        ``finetune_step`` (reconstruction plus clustering). They are split so
+        each can be traced once by ``tf.function``. ``mom`` is a list of
+        non-trainable tf.Variables holding the momentum state, which must
+        persist across calls; ``lr`` and ``beta`` are baked in as constants.
         """
-        num_samples = X_train.shape[0]
-        self.neighbors_dict = neighbors_dict
-        self.sim_matrix = sim_matrix
-        all_vars = self.encoder_vars + self.decoder_vars
-        
-        # Initialize momentum buffers for reconstruction/reg updates
-        m = [tf.zeros_like(v) for v in all_vars]
-        # Separate buffer for encoder-only (clustering) updates
-        m_enc = [tf.zeros_like(v) for v in self.encoder_vars]
-        
-        self.epoch_loss = []
-        
-        for epoch in range(epochs):
-            # Shuffle data indices for mini-batch sampling
-            indices = np.random.permutation(num_samples)
-            # Placeholder to store latent codes in original order
-            X_reduced_full = np.empty((num_samples, self.s), dtype=np.float32)
-            
-            # --- Mini-batch loop ---
-            for start in range(0, num_samples, batch_size):
-                end = min(start + batch_size, num_samples)
-                batch_idx = indices[start:end]
-                x_batch = X_train[batch_idx]
-                
-                # Compute gradients on total loss (recon + L2 + L1)
-                with tf.GradientTape() as tape:
-                    # Forward pass: encode and decode 
-                    latent = self.encoder(x_batch)
-                    recon  = self.decoder(latent)
-                    total_loss = self.loss_t(x_batch, recon)
-                grads = tape.gradient(total_loss, all_vars)
-                
-                # Momentum update + parameter step
-                for i, (v, g) in enumerate(zip(all_vars, grads)):
-                    m[i] = beta * m[i] + (1. - beta) * g
-                    v.assign_sub(learning_rate * m[i])
-                
-                # Store latents for clustering step
-                X_reduced_full[batch_idx] = latent.numpy()
-            
-            # --- Clustering step (after each epoch) ---
-            cluster = ConvexClustering(X_reduced_full, self.neighbors_dict, self.sim_matrix)
-            cluster_labels = cluster.fit()
-            cluster_labels_tf = tf.constant(cluster_labels, dtype=tf.int32)
-            
-            # Compute clustering‐loss gradients w.r.t. encoder_vars
+        def _update(grads):
+            for i in range(len(params)):
+                g = grads[i] if grads[i] is not None else tf.zeros_like(params[i])
+                mom[i].assign(beta * mom[i] + (1.0 - beta) * g)
+                params[i].assign_sub(lr * mom[i])
+
+        def pretrain_step(xb):
             with tf.GradientTape() as tape:
-                X_latent_full = self.encoder(X_train)
-                L_c = self.clustering_loss(X_latent_full, cluster_labels_tf)
-                cluster_loss = self.lambda_c * L_c
-            grads_enc = tape.gradient(cluster_loss, self.encoder_vars)
-            
-            # Momentum update + step for encoder only
-            for i, (v, g) in enumerate(zip(self.encoder_vars, grads_enc)):
-                m_enc[i] = beta * m_enc[i] + (1. - beta) * g
-                v.assign_sub(learning_rate * m_enc[i])
-            
-            # Log the last batch’s reconstruction loss
-            self.epoch_loss.append(float(total_loss.numpy()))
-            # print(f"Epoch {epoch+1}/{epochs} loss: {self.epoch_loss[-1]:.4f}")
-    
-    ## ---------------------------------------------------------------------
-    def predict(self, coeffs, batch_size = None):
+                zb = self.encoder(xb, training=True)
+                recon = self.decoder(zb, training=True)
+                loss = self.penalized_recon(xb, recon)
+            _update(tape.gradient(loss, params))
+            return loss
+
+        def finetune_step(xb, lbl_b, means, global_mean):
+            with tf.GradientTape() as tape:
+                zb = self.encoder(xb, training=True)
+                recon = self.decoder(zb, training=True)
+                loss = self.penalized_recon(xb, recon) + self.lambda_c * \
+                    self.clustering_loss_cached(zb, lbl_b, means, global_mean)
+            _update(tape.gradient(loss, params))
+            return loss
+
+        return pretrain_step, finetune_step
+
+    def train_model(self, X_train, epochs, learning_rate, batch_size,
+                     neighbors_dict, sim_matrix, beta=0.9,
+                     pretrain_epochs=0, criterion='silhouette', verbose=False,
+                     device=None, cluster_every=5, jit=True):
+        """Train the model with manual mini-batch SGD-with-momentum.
+
+        The first ``pretrain_epochs`` epochs minimise the penalized
+        reconstruction loss only; the remaining epochs add the clustering term
+        and take a single backward step over all parameters.
+
+        The expensive convex-clustering step plus a full-data encode runs once
+        every ``cluster_every`` epochs. In between, the clustering loss is
+        evaluated per minibatch against the cached, detached cluster centroids
+        and global mean. Minibatch steps run with training=True (so batch norm
+        uses batch statistics and updates its moving averages, and dropout is
+        active); the cluster-refresh encode runs with training=False.
+
+        jit : bool, default True
+            Wrap the per-minibatch train step in ``tf.function`` (graph mode).
+            This removes the per-op Python overhead of the many small
+            einsum/matmul ops and the momentum update, making training
+            noticeably faster. A fixed input signature (with the batch and
+            cluster-count axes left dynamic) means each step is traced exactly
+            once. Set ``jit=False`` to keep a pure-eager loop (useful for
+            debugging).
         """
-        Encode new data, then cluster latent codes.
+        dev = pick_device(device)
+        self.device = dev
+        self.neighbors_dict = neighbors_dict
+        self.sim_matrix = np.asarray(sim_matrix)
+        self.epoch_loss = []
+        lr = float(learning_rate)
+        beta = float(beta)
 
-        Parameters
-        ----------
-        coeffs : array_like or tf.Tensor, shape [N, p, l]
-            Input coefficients to encode.
-        batch_size : int or None
-            Batch size for encoding. Defaults to all samples at once.
+        with tf.device(dev):
+            Xt = tf.constant(np.asarray(X_train), dtype=tf.float32)
+            n = Xt.shape[0]
+            params = self.trainable_variables
+            # Momentum buffers must be Variables so their state survives across
+            # tf.function calls (rebinding a plain tensor would not persist).
+            mom = [tf.Variable(tf.zeros_like(p), trainable=False) for p in params]
 
-        Returns
-        -------
-        latents : np.ndarray, shape [N, s]
-            Latent representations.
-        labels : list of int, length N
-            Cluster labels assigned by convex clustering.
-        """
-        if batch_size == None:
-            ds = tf.data.Dataset.from_tensor_slices(coeffs).batch(coeffs.shape[0])
-        else:
-            ds = tf.data.Dataset.from_tensor_slices(coeffs).batch(batch_size)
-            
-        latents = []
+            # Deterministic minibatch shuffle keyed to the model seed, so a run
+            # is fully reproducible from `seed` alone (the global np.random state
+            # left by earlier cells / data generation no longer affects it).
+            rng = np.random.default_rng(self.seed)
 
-        for x_batch in ds:
-            z = self.encoder(x_batch)  # [batch, s]
-            latents.append(z)
-        
-        # Cluster the latent outputs
-        latents = tf.concat(latents, axis=0)
-        cluster = ConvexClustering(latents, self.neighbors_dict, self.sim_matrix)
-        labels = cluster.fit()
-        return latents.numpy(), labels
-    
-    ## ---------------------------------------------------------------------
+            pretrain_step, finetune_step = self._make_steps(params, mom, lr, beta)
+            if jit:
+                sx = tf.TensorSpec([None, self.p, self.m], tf.float32)
+                sl = tf.TensorSpec([None], tf.int32)
+                sm = tf.TensorSpec([None, self.s], tf.float32)
+                sg = tf.TensorSpec([self.s], tf.float32)
+                pretrain_step = tf.function(pretrain_step, input_signature=[sx])
+                finetune_step = tf.function(finetune_step,
+                                            input_signature=[sx, sl, sm, sg])
+
+            labels_t = means = global_mean = None
+            for epoch in range(epochs):
+                do_cluster = epoch >= pretrain_epochs and self.lambda_c != 0
+                # Refresh cluster assignment + cached centroids periodically.
+                if do_cluster and (labels_t is None
+                                   or (epoch - pretrain_epochs) % cluster_every == 0):
+                    Z = self.encoder(Xt, training=False)
+                    Znp = Z.numpy()
+                    cc = ConvexClustering(Znp, self.neighbors_dict,
+                                          self.sim_matrix, criterion=criterion)
+                    labels = np.asarray(cc.fit())
+                    labels_t = tf.constant(labels, dtype=tf.int32)
+                    K = int(labels.max()) + 1
+                    means = tf.stop_gradient(
+                        tf.math.unsorted_segment_mean(Z, labels_t, num_segments=K))
+                    global_mean = tf.stop_gradient(tf.reduce_mean(Z, axis=0))
+
+                perm = rng.permutation(n)
+                running = 0.0
+                n_batches = 0
+                for s0 in range(0, n, batch_size):
+                    idx = perm[s0:s0 + batch_size]
+                    xb = tf.gather(Xt, idx)
+                    if do_cluster:
+                        lbl_b = tf.gather(labels_t, idx)
+                        loss = finetune_step(xb, lbl_b, means, global_mean)
+                    else:
+                        loss = pretrain_step(xb)
+                    running += float(loss.numpy())
+                    n_batches += 1
+                self.epoch_loss.append(running / max(1, n_batches))
+                if verbose:
+                    tag = "pretrain" if not do_cluster else "finetune"
+                    print(f"epoch {epoch+1}/{epochs} [{tag}] "
+                          f"loss={self.epoch_loss[-1]:.4f}")
+
+    def predict(self, coeffs, batch_size=None, criterion='silhouette'):
+        dev = getattr(self, 'device', None) or pick_device(None)
+        with tf.device(dev):
+            Xt = tf.constant(np.asarray(coeffs), dtype=tf.float32)
+            if batch_size is None:
+                Z = self.encoder(Xt, training=False)
+            else:
+                Z = tf.concat([self.encoder(Xt[i:i + batch_size], training=False)
+                               for i in range(0, Xt.shape[0], batch_size)], axis=0)
+        Z = Z.numpy()
+        cc = ConvexClustering(Z, self.neighbors_dict, self.sim_matrix,
+                              criterion=criterion)
+        labels = cc.fit()
+        return Z, labels
+
     def model_summary(self):
-        """
-        Print a summary of all trainable parameters.
+        params = self.trainable_variables
+        tot = int(sum(np.prod(v.shape) for v in params))
+        print("=" * 60)
+        print("FunctionalAutoencoder (TensorFlow)")
+        for v in params:
+            name = getattr(v, 'path', None) or v.name
+            print(f"{name:<28} {tuple(v.shape)!s:<22} {int(np.prod(v.shape))}")
+        print("=" * 60)
+        print(f"Total trainable parameters: {tot}")
 
-        Displays layer names, shapes, and parameter counts.
-        """
-        print("=" * 70)
-        print("Functional Autoencoder:")
-        print(f"{'Layer (type)':<25} {'Shape':<30} {'Param #':<10}")
-        print("=" * 70)
-        total_params = 0
-        # functional encoder first layer
-        for var in (self.wfn, self.bfn):
-            name = var.name.split(':')[0]
-            shape = var.shape
-            params = np.prod(shape)
-            print(f"{name:<25} {str(shape):<30} {int(params):<10}")
-            total_params += params
-        # encoder MLP layers 
-        for W, b in zip(self.W_dense_enc, self.b_dense_enc):
-            for var in (W, b):
-                name = var.name.split(':')[0]
-                shape = var.shape
-                params = np.prod(shape)
-                print(f"{name:<25} {str(shape):<30} {int(params):<10}")
-                total_params += params
-        # decoder MLP layers
-        for W, b in zip(self.W_dense_dec, self.b_dense_dec):
-            for var in (W, b):
-                name = var.name.split(':')[0]
-                shape = var.shape
-                params = np.prod(shape)
-                print(f"{name:<25} {str(shape):<30} {int(params):<10}")
-                total_params += params
-        # functional decoder layers
-        for var in (self.Wfn1, self.Bfn1, self.Wfn2, self.Bfn2, self.Wfn3):
-            name = var.name.split(':')[0]
-            shape = var.shape
-            params = np.prod(shape)
-            print(f"{name:<25} {str(shape):<30} {int(params):<10}")
-            total_params += params
-        print("=" * 70)
-        print(f"Total trainable parameters: {int(total_params)}")
-        print("=" * 70)
-        
 ## ------------------------------------------------------------------------- ##
