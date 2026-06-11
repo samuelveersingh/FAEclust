@@ -291,7 +291,8 @@ ConvexClustering(
 		- **`cluster_labels`** _(np.ndarray, shape=(n_samples,))_ : The (optimal) cluster labels.
 
 
-## Convenience utilities
+----------
+## Convenience Utilities
 
 -   **`run_experiment(dataset='pendulum', ...)`** – One call that runs the entire pipeline
     (generate → distance → m-NN → smooth → train → cluster → score) on a built-in synthetic
