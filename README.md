@@ -1,6 +1,9 @@
 
 # FAEclust: Cluster Analysis of Multi-Dimensional Functional Data
 
+> A complete, self-contained **PyTorch** implementation of FAEclust is availble at [FAEclust-torch](https://github.com/samuelveersingh/FAEclust-torch).
+
+
 FAEclust is the first autoencoder architecture designed specifically for **clustering multi-dimensional functional data**. In FAEclust, we employ univariate functions as weights instead of integral kernels:
 
 1. Unlike traditional regression models, where integral kernels are used for functional predictors to capture full dependence, our encoder is designed to learn latent representations. Consequently, the univariate functions serve as a coordinate system in the Hilbert space.
