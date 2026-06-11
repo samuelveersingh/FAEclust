@@ -39,7 +39,7 @@ The modular pipeline for FAEclust has the following structure:
 3. **FAE network**: Configure and train the functional network via `FunctionalAutoencoder()`.
 4. **Convex Clustering**: Cluster analysis of the latent representations, where the clustering objective function is a convex function (`ConvexClustering()`).
 
-> A one-call convenience, `run_experiment()`, runs this whole pipeline on a built-in synthetic dataset, and an optional `tuning` utility performs Optuna hyperparameter search. See [Convenience utilities](#convenience-utilities) below.
+> A one-call convenience, `run_experiment()`, runs this whole pipeline on a built-in synthetic dataset, and an optional `tuning` utility performs Optuna hyperparameter search. See [Convenience Utilities](#convenience-utilities) below.
 
 ----------
 
